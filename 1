@@ -1,23 +1,29 @@
 #!/bin/bash
 
 non_compliant_count=0
+total_checked=0
 
 # Get all AWS regions
 regions=$(aws ec2 describe-regions --query 'Regions[*].RegionName' --output text)
 
+echo -e "\n🔍 Starting SQS compliance audit across all AWS regions...\n"
+
 for region in $regions; do
-  echo "Scanning region: $region..."
+  echo "🌎 Scanning region: $region"
 
   # Get all SQS queues in the region
   queue_urls=$(aws sqs list-queues --region "$region" --query 'QueueUrls' --output text 2>/dev/null)
 
   if [[ -z "$queue_urls" ]]; then
-    echo "  No queues found in $region."
+    echo "  ➤ No SQS queues found in $region."
     continue
   fi
 
   for queue_url in $queue_urls; do
-    # Get policy with a 10-second timeout to avoid hanging
+    echo "  🔄 Checking queue: $queue_url"
+    ((total_checked++))
+
+    # Get the policy attribute (10 sec timeout)
     raw_policy=$(timeout 10 aws sqs get-queue-attributes \
       --region "$region" \
       --queue-url "$queue_url" \
@@ -26,20 +32,31 @@ for region in $regions; do
       --output text 2>/dev/null)
 
     if [[ $? -ne 0 ]]; then
-      echo "  ⚠️ Timeout or error fetching policy for: $queue_url"
+      echo "    ⚠️  Skipped due to timeout or error."
       continue
     fi
 
-    if [[ "$raw_policy" != "None" && "$raw_policy" != "null" ]]; then
-      policy=$(echo "$raw_policy" | tr -d '[:space:]')
+    if [[ "$raw_policy" == "None" || "$raw_policy" == "null" ]]; then
+      echo "    ✅ Compliant (no policy attached)"
+      continue
+    fi
 
-      if [[ "$policy" == *'"Effect":"Allow"'* && "$policy" == *'"Principal":"*"'* ]]; then
-        ((non_compliant_count++))
-      elif [[ "$policy" == *'"Effect":"Allow"'* && "$policy" == *'"AWS":"*"'* ]]; then
-        ((non_compliant_count++))
-      fi
+    # Clean up the policy string
+    policy=$(echo "$raw_policy" | tr -d '[:space:]')
+
+    # Check for public access
+    if [[ "$policy" == *'"Effect":"Allow"'* && "$policy" == *'"Principal":"*"'* ]]; then
+      echo "    ❌ Non-Compliant: Principal is '*' with Effect 'Allow'"
+      ((non_compliant_count++))
+    elif [[ "$policy" == *'"Effect":"Allow"'* && "$policy" == *'"AWS":"*"'* ]]; then
+      echo "    ❌ Non-Compliant: Principal.AWS is '*' with Effect 'Allow'"
+      ((non_compliant_count++))
+    else
+      echo "    ✅ Compliant"
     fi
   done
 done
 
-echo -e "\nTotal Non-Compliant SQS Queues: $non_compliant_count"
+echo -e "\n📊 Audit Summary:"
+echo "  ➤ Total queues checked: $total_checked"
+echo "  ❌ Non-Compliant queues: $non_compliant_count"
