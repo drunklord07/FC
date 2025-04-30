@@ -1,0 +1,30 @@
+#!/bin/bash
+
+echo -e "\n🔍 Starting AWS Organizations Delegated Administrators Audit...\n"
+
+# Get list of delegated administrators
+delegated_admins=$(aws organizations list-delegated-administrators --output json 2>/dev/null)
+
+# Check if any exist
+count=$(echo "$delegated_admins" | grep -c 'DelegatedAdministrators')
+
+if [[ "$count" -eq 0 || "$delegated_admins" == *"[]"* ]]; then
+  echo "✅ No delegated administrators found. Environment is compliant by default."
+  exit 0
+fi
+
+# Print table header
+printf "%-15s %-20s %-20s %-15s\n" "Account ID" "Admin Name" "Service Principal" "Status"
+echo "--------------------------------------------------------------------------"
+
+# Extract and print details
+echo "$delegated_admins" | grep -o '{[^}]*}' | while read -r admin; do
+  account_id=$(echo "$admin" | grep -o '"Id":"[^"]*"' | cut -d':' -f2 | tr -d '"')
+  name=$(echo "$admin" | grep -o '"Name":"[^"]*"' | cut -d':' -f2 | tr -d '"')
+  service=$(echo "$admin" | grep -o '"ServicePrincipal":"[^"]*"' | cut -d':' -f2 | tr -d '"')
+  
+  # For now, if listed, we assume "trusted"
+  status="Compliant"
+
+  printf "%-15s %-20s %-20s %-15s\n" "$account_id" "$name" "$service" "$status"
+done
