@@ -1,6 +1,6 @@
 #!/bin/bash
 
-REGION="us-east-1"  # Change this to your desired region
+REGION="us-east-1"  # Change as needed
 
 echo -e "\nAuditing SQS queues in region: $REGION\n"
 echo -e "Queue URL\t\t\t\t\tAccount ID\t\tStatus"
@@ -14,31 +14,29 @@ if [[ -z "$queue_urls" ]]; then
 fi
 
 for queue_url in $queue_urls; do
-  # Extract AWS Account ID from URL
+  # Extract AWS Account ID from the queue URL
   account_id=$(echo "$queue_url" | cut -d '/' -f 4)
 
-  # Get the queue policy
-  policy_json=$(aws sqs get-queue-attributes \
+  # Get the policy attribute as raw text
+  policy=$(aws sqs get-queue-attributes \
     --region "$REGION" \
     --queue-url "$queue_url" \
-    --attribute-names "Policy" \
+    --attribute-names Policy \
     --query 'Attributes.Policy' \
     --output text 2>/dev/null)
 
   # Default status
   status="Compliant"
 
-  if [[ "$policy_json" != "None" && "$policy_json" != "null" ]]; then
-    # Check for Effect:Allow and Principal:"*"
-    is_public=$(echo "$policy_json" | jq -r '
-      .Statement[]? |
-      select(.Effect=="Allow" and (.Principal=="*" or .Principal.AWS=="*") and (.Condition==null))')
-
-    if [[ -n "$is_public" ]]; then
+  # Check for public access
+  if [[ "$policy" != "None" && "$policy" != "null" ]]; then
+    if [[ "$policy" == *'"Effect":"Allow"'* && "$policy" == *'"Principal":"*"'* ]]; then
+      status="Non-Compliant"
+    elif [[ "$policy" == *'"Effect":"Allow"'* && "$policy" == *'"AWS":"*"'* ]]; then
       status="Non-Compliant"
     fi
   fi
 
-  # Print table row
+  # Print result
   printf "%s\t%s\t%s\n" "$queue_url" "$account_id" "$status"
 done
