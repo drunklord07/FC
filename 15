@@ -1,0 +1,91 @@
+#!/bin/bash
+
+echo -e "\n🔍 Starting RDS & Aurora SSL/TLS Encryption Compliance Audit...\n"
+
+# Table header
+printf "%-30s %-12s %-8s %-15s %-28s %-8s %-15s\n" "Resource Name" "Region" "Type" "Account ID" "Parameter" "Value" "Status"
+echo "---------------------------------------------------------------------------------------------------------------"
+
+# Get all regions
+regions=$(aws ec2 describe-regions --query 'Regions[*].RegionName' --output text)
+
+# Loop through each region
+for region in $regions; do
+  # Get RDS DB instance identifiers
+  dbs=$(aws rds describe-db-instances --region "$region" --query 'DBInstances[*].DBInstanceIdentifier' --output text 2>/dev/null)
+
+  for db in $dbs; do
+    # Get parameter group name
+    param_group=$(aws rds describe-db-instances \
+      --region "$region" \
+      --db-instance-identifier "$db" \
+      --query 'DBInstances[0].DBParameterGroups[0].DBParameterGroupName' \
+      --output text 2>/dev/null)
+
+    # Check SSL-related parameter
+    params=$(aws rds describe-db-parameters \
+      --region "$region" \
+      --db-parameter-group-name "$param_group" \
+      --query 'Parameters[?ParameterName==`rds.force_ssl` || ParameterName==`require_secure_transport`]' \
+      --output json 2>/dev/null)
+
+    # Extract values
+    name=$(echo "$params" | grep -o '"ParameterName": *"[^"]*"' | cut -d'"' -f4)
+    value=$(echo "$params" | grep -o '"ParameterValue": *"[^"]*"' | cut -d'"' -f4)
+    value=${value:-"NOT SET"}
+
+    # Determine compliance
+    if [[ "$value" == "1" || "$value" == "ON" ]]; then
+      status="Compliant"
+    else
+      status="Non-Compliant"
+    fi
+
+    # Get account ID
+    arn=$(aws rds describe-db-instances --region "$region" \
+          --db-instance-identifier "$db" \
+          --query 'DBInstances[0].DBInstanceArn' --output text 2>/dev/null)
+    uid=$(echo "$arn" | cut -d':' -f5)
+
+    # Print row
+    printf "%-30s %-12s %-8s %-15s %-28s %-8s %-15s\n" "$db" "$region" "RDS" "$uid" "$name" "$value" "$status"
+  done
+
+  # Get Aurora clusters
+  clusters=$(aws rds describe-db-clusters --region "$region" --query 'DBClusters[*].DBClusterIdentifier' --output text 2>/dev/null)
+
+  for cluster in $clusters; do
+    # Get cluster parameter group
+    cluster_pg=$(aws rds describe-db-clusters --region "$region" \
+      --db-cluster-identifier "$cluster" \
+      --query 'DBClusters[0].DBClusterParameterGroup' --output text 2>/dev/null)
+
+    # Check SSL-related parameter
+    cluster_params=$(aws rds describe-db-cluster-parameters \
+      --region "$region" \
+      --db-cluster-parameter-group-name "$cluster_pg" \
+      --query 'Parameters[?ParameterName==`rds.force_ssl` || ParameterName==`require_secure_transport`]' \
+      --output json 2>/dev/null)
+
+    # Extract values
+    cname=$(echo "$cluster_params" | grep -o '"ParameterName": *"[^"]*"' | cut -d'"' -f4)
+    cvalue=$(echo "$cluster_params" | grep -o '"ParameterValue": *"[^"]*"' | cut -d'"' -f4)
+    cvalue=${cvalue:-"NOT SET"}
+
+    # Determine compliance
+    if [[ "$cvalue" == "1" || "$cvalue" == "ON" ]]; then
+      status="Compliant"
+    else
+      status="Non-Compliant"
+    fi
+
+    # Get account ID
+    carn=$(aws rds describe-db-clusters --region "$region" \
+          --db-cluster-identifier "$cluster" \
+          --query 'DBClusters[0].DBClusterArn' --output text 2>/dev/null)
+    cuid=$(echo "$carn" | cut -d':' -f5)
+
+    # Print row
+    printf "%-30s %-12s %-8s %-15s %-28s %-8s %-15s\n" "$cluster" "$region" "Aurora" "$cuid" "$cname" "$cvalue" "$status"
+  done
+done
