@@ -1,0 +1,53 @@
+#!/bin/bash
+
+echo -e "\n🔍 Starting OpenSearch Authentication Compliance Audit...\n"
+
+# Print table header
+printf "%-25s %-15s %-15s %-15s %-15s\n" "Domain Name" "Region" "Account ID" "Auth Type" "Status"
+echo "---------------------------------------------------------------------------------------------"
+
+# Get all AWS regions
+regions=$(aws ec2 describe-regions --query 'Regions[*].RegionName' --output text)
+
+for region in $regions; do
+  domains=$(aws es list-domain-names --region "$region" --query 'DomainNames[*].DomainName' --output text 2>/dev/null)
+
+  if [[ -z "$domains" ]]; then
+    continue
+  fi
+
+  for domain in $domains; do
+    # Get domain details
+    domain_details=$(aws es describe-elasticsearch-domain --region "$region" --domain-name "$domain" --output json 2>/dev/null)
+
+    # Skip if unable to fetch
+    if [[ -z "$domain_details" ]]; then
+      echo "⚠️  Could not retrieve details for domain '$domain' in $region"
+      continue
+    fi
+
+    # Check for Cognito auth
+    cognito_enabled=$(echo "$domain_details" | grep -o '"Enabled":true' | grep -c 'CognitoOptions')
+    # Check for SAML auth
+    saml_enabled=$(echo "$domain_details" | grep -A3 '"SAMLOptions"' | grep '"Enabled":true' | wc -l)
+
+    # Determine auth type
+    if [[ "$cognito_enabled" -ge 1 ]]; then
+      auth="Cognito"
+      status="Compliant"
+    elif [[ "$saml_enabled" -ge 1 ]]; then
+      auth="SAML"
+      status="Compliant"
+    else
+      auth="None"
+      status="Non-Compliant"
+    fi
+
+    # Get account ID from domain ARN
+    arn=$(echo "$domain_details" | grep -o '"ARN":"[^"]*"' | cut -d'"' -f4)
+    uid=$(echo "$arn" | cut -d':' -f5)
+
+    # Print result row
+    printf "%-25s %-15s %-15s %-15s %-15s\n" "$domain" "$region" "$uid" "$auth" "$status"
+  done
+done
