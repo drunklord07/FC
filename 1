@@ -1,13 +1,12 @@
 #!/bin/bash
 
+non_compliant_count=0
+
 # Get all AWS regions
 regions=$(aws ec2 describe-regions --query 'Regions[*].RegionName' --output text)
 
-# Print table header
-printf "\n%-20s %-70s %-15s %-15s\n" "Region" "Queue URL" "Account ID" "Status"
-
 for region in $regions; do
-  # Get all SQS queues in the region
+  # Get all SQS queues in this region
   queue_urls=$(aws sqs list-queues --region "$region" --query 'QueueUrls' --output text 2>/dev/null)
 
   if [[ -z "$queue_urls" ]]; then
@@ -15,10 +14,7 @@ for region in $regions; do
   fi
 
   for queue_url in $queue_urls; do
-    # Extract Account ID
-    account_id=$(echo "$queue_url" | cut -d '/' -f 4)
-
-    # Get policy attribute
+    # Get policy
     raw_policy=$(aws sqs get-queue-attributes \
       --region "$region" \
       --queue-url "$queue_url" \
@@ -26,22 +22,16 @@ for region in $regions; do
       --query 'Attributes.Policy' \
       --output text 2>/dev/null)
 
-    # Default to Compliant
-    status="Compliant"
-
     if [[ "$raw_policy" != "None" && "$raw_policy" != "null" ]]; then
-      # Strip whitespace
       policy=$(echo "$raw_policy" | tr -d '[:space:]')
 
-      # Check for public access
       if [[ "$policy" == *'"Effect":"Allow"'* && "$policy" == *'"Principal":"*"'* ]]; then
-        status="Non-Compliant"
+        ((non_compliant_count++))
       elif [[ "$policy" == *'"Effect":"Allow"'* && "$policy" == *'"AWS":"*"'* ]]; then
-        status="Non-Compliant"
+        ((non_compliant_count++))
       fi
     fi
-
-    # Output row
-    printf "%-20s %-70s %-15s %-15s\n" "$region" "$queue_url" "$account_id" "$status"
   done
 done
+
+echo "Total Non-Compliant SQS Queues: $non_compliant_count"
