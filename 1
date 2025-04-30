@@ -1,46 +1,47 @@
 #!/bin/bash
 
-REGION="us-east-1"  # Set your region here
+# Get all AWS regions
+regions=$(aws ec2 describe-regions --query 'Regions[*].RegionName' --output text)
 
-echo -e "\nAuditing SQS queues in region: $REGION\n"
-printf "%-70s %-15s %-15s\n" "Queue URL" "Account ID" "Status"
+# Print table header
+printf "\n%-20s %-70s %-15s %-15s\n" "Region" "Queue URL" "Account ID" "Status"
 
-# Get list of SQS queues
-queue_urls=$(aws sqs list-queues --region "$REGION" --query 'QueueUrls' --output text)
+for region in $regions; do
+  # Get all SQS queues in the region
+  queue_urls=$(aws sqs list-queues --region "$region" --query 'QueueUrls' --output text 2>/dev/null)
 
-if [[ -z "$queue_urls" ]]; then
-  echo "No SQS queues found in region $REGION."
-  exit 0
-fi
-
-# Loop through each queue URL
-for queue_url in $queue_urls; do
-  # Extract Account ID
-  account_id=$(echo "$queue_url" | cut -d '/' -f 4)
-
-  # Get policy attribute
-  raw_policy=$(aws sqs get-queue-attributes \
-    --region "$REGION" \
-    --queue-url "$queue_url" \
-    --attribute-names Policy \
-    --query 'Attributes.Policy' \
-    --output text 2>/dev/null)
-
-  # Default to Compliant
-  status="Compliant"
-
-  # Check for public access
-  if [[ "$raw_policy" != "None" && "$raw_policy" != "null" ]]; then
-    # Remove whitespace to simplify matching
-    policy=$(echo "$raw_policy" | tr -d '[:space:]')
-
-    if [[ "$policy" == *'"Effect":"Allow"'* && "$policy" == *'"Principal":"*"'* ]]; then
-      status="Non-Compliant"
-    elif [[ "$policy" == *'"Effect":"Allow"'* && "$policy" == *'"AWS":"*"'* ]]; then
-      status="Non-Compliant"
-    fi
+  if [[ -z "$queue_urls" ]]; then
+    continue
   fi
 
-  # Print result
-  printf "%-70s %-15s %-15s\n" "$queue_url" "$account_id" "$status"
+  for queue_url in $queue_urls; do
+    # Extract Account ID
+    account_id=$(echo "$queue_url" | cut -d '/' -f 4)
+
+    # Get policy attribute
+    raw_policy=$(aws sqs get-queue-attributes \
+      --region "$region" \
+      --queue-url "$queue_url" \
+      --attribute-names Policy \
+      --query 'Attributes.Policy' \
+      --output text 2>/dev/null)
+
+    # Default to Compliant
+    status="Compliant"
+
+    if [[ "$raw_policy" != "None" && "$raw_policy" != "null" ]]; then
+      # Strip whitespace
+      policy=$(echo "$raw_policy" | tr -d '[:space:]')
+
+      # Check for public access
+      if [[ "$policy" == *'"Effect":"Allow"'* && "$policy" == *'"Principal":"*"'* ]]; then
+        status="Non-Compliant"
+      elif [[ "$policy" == *'"Effect":"Allow"'* && "$policy" == *'"AWS":"*"'* ]]; then
+        status="Non-Compliant"
+      fi
+    fi
+
+    # Output row
+    printf "%-20s %-70s %-15s %-15s\n" "$region" "$queue_url" "$account_id" "$status"
+  done
 done
