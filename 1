@@ -1,10 +1,44 @@
 #!/bin/bash
 
-# Check if EC2 serial console access is enabled in the account
-status=$(aws ec2 get-serial-console-access-status --query "SerialConsoleAccessEnabled" --output text)
+REGION="us-east-1"  # Change this to your desired region
 
-if [[ "$status" == "False" ]]; then
-  echo "Compliant: EC2 serial console access is disabled."
-else
-  echo "Non-Compliant: EC2 serial console access is ENABLED."
+echo -e "\nAuditing SQS queues in region: $REGION\n"
+echo -e "Queue URL\t\t\t\t\tAccount ID\t\tStatus"
+
+# Get list of SQS queues
+queue_urls=$(aws sqs list-queues --region "$REGION" --query 'QueueUrls' --output text)
+
+if [[ -z "$queue_urls" ]]; then
+  echo "No queues found in region $REGION."
+  exit 0
 fi
+
+for queue_url in $queue_urls; do
+  # Extract AWS Account ID from URL
+  account_id=$(echo "$queue_url" | cut -d '/' -f 4)
+
+  # Get the queue policy
+  policy_json=$(aws sqs get-queue-attributes \
+    --region "$REGION" \
+    --queue-url "$queue_url" \
+    --attribute-names "Policy" \
+    --query 'Attributes.Policy' \
+    --output text 2>/dev/null)
+
+  # Default status
+  status="Compliant"
+
+  if [[ "$policy_json" != "None" && "$policy_json" != "null" ]]; then
+    # Check for Effect:Allow and Principal:"*"
+    is_public=$(echo "$policy_json" | jq -r '
+      .Statement[]? |
+      select(.Effect=="Allow" and (.Principal=="*" or .Principal.AWS=="*") and (.Condition==null))')
+
+    if [[ -n "$is_public" ]]; then
+      status="Non-Compliant"
+    fi
+  fi
+
+  # Print table row
+  printf "%s\t%s\t%s\n" "$queue_url" "$account_id" "$status"
+done
