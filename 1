@@ -1,0 +1,10 @@
+#!/bin/bash
+
+# Check if EC2 serial console access is enabled in the account
+status=$(aws ec2 get-serial-console-access-status --query "SerialConsoleAccessEnabled" --output text)
+
+if [[ "$status" == "False" ]]; then
+  echo "Compliant: EC2 serial console access is disabled."
+else
+  echo "Non-Compliant: EC2 serial console access is ENABLED."
+fi
