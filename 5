@@ -2,16 +2,19 @@
 
 echo -e "\n🔍 IAM Server Certificate Expiration Audit (Global Scope)\n"
 
-# Get current UTC time in ISO format
+# Get current time in ISO 8601 format
 now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
-# List IAM server certificates
-certs=$(aws iam list-server-certificates --query 'ServerCertificateMetadataList' --output json 2>/dev/null)
+# Fetch certificates
+certs=$(aws iam list-server-certificates --output json 2>/dev/null)
+
+# Debug: show raw output if needed
+echo "🔧 Raw AWS Response:"
+echo "$certs"
+echo ""
 
 # Check if any certs exist
-count=$(echo "$certs" | grep -c 'ServerCertificateName')
-
-if [[ "$count" -eq 0 ]]; then
+if [[ "$certs" == *"ServerCertificateMetadataList\": []"* ]] || [[ -z "$certs" ]]; then
   echo "✅ No IAM server certificates found. Environment is compliant."
   exit 0
 fi
@@ -20,7 +23,7 @@ fi
 printf "%-30s %-20s %-15s %-25s %-15s\n" "Certificate Name" "Certificate ID" "Account ID" "Expiration Date" "Status"
 echo "---------------------------------------------------------------------------------------------------------------------------"
 
-# Parse and check each certificate
+# Extract individual cert blocks and evaluate them
 echo "$certs" | grep -o '{[^}]*}' | while read -r cert; do
   name=$(echo "$cert" | grep -o '"ServerCertificateName":"[^"]*"' | cut -d':' -f2 | tr -d '"')
   id=$(echo "$cert" | grep -o '"ServerCertificateId":"[^"]*"' | cut -d':' -f2 | tr -d '"')
@@ -28,13 +31,13 @@ echo "$certs" | grep -o '{[^}]*}' | while read -r cert; do
   arn=$(echo "$cert" | grep -o '"Arn":"[^"]*"' | cut -d':' -f2- | tr -d '"')
   uid=$(echo "$arn" | cut -d':' -f5)
 
-  # Determine compliance
+  # Determine if expired
   if [[ "$expiration" < "$now" ]]; then
     status="Non-Compliant"
   else
     status="Compliant"
   fi
 
-  # Print result
+  # Print table row
   printf "%-30s %-20s %-15s %-25s %-15s\n" "$name" "$id" "$uid" "$expiration" "$status"
 done
