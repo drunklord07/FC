@@ -1,20 +1,16 @@
 #!/bin/bash
 
-echo -e "\n🔍 IAM Server Certificate Expiration Audit (Global Scope)\n"
+echo -e "\n🔍 IAM Server Certificate Expiration Audit & Auto-Removal (Global Scope)\n"
 
-# Get current time in ISO 8601 format
 now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+removed_count=0
+total_checked=0
 
-# Fetch certificates
-certs=$(aws iam list-server-certificates --output json 2>/dev/null)
+# List server certificates
+certs=$(aws iam list-server-certificates --query 'ServerCertificateMetadataList' --output json 2>/dev/null)
 
-# Debug: show raw output if needed
-echo "🔧 Raw AWS Response:"
-echo "$certs"
-echo ""
-
-# Check if any certs exist
-if [[ "$certs" == *"ServerCertificateMetadataList\": []"* ]] || [[ -z "$certs" ]]; then
+# Check if any exist
+if [[ "$certs" == *"[]"* || -z "$certs" ]]; then
   echo "✅ No IAM server certificates found. Environment is compliant."
   exit 0
 fi
@@ -23,21 +19,28 @@ fi
 printf "%-30s %-20s %-15s %-25s %-15s\n" "Certificate Name" "Certificate ID" "Account ID" "Expiration Date" "Status"
 echo "---------------------------------------------------------------------------------------------------------------------------"
 
-# Extract individual cert blocks and evaluate them
+# Loop through each certificate
 echo "$certs" | grep -o '{[^}]*}' | while read -r cert; do
   name=$(echo "$cert" | grep -o '"ServerCertificateName":"[^"]*"' | cut -d':' -f2 | tr -d '"')
   id=$(echo "$cert" | grep -o '"ServerCertificateId":"[^"]*"' | cut -d':' -f2 | tr -d '"')
   expiration=$(echo "$cert" | grep -o '"Expiration":"[^"]*"' | cut -d':' -f2- | tr -d '"')
   arn=$(echo "$cert" | grep -o '"Arn":"[^"]*"' | cut -d':' -f2- | tr -d '"')
   uid=$(echo "$arn" | cut -d':' -f5)
+  ((total_checked++))
 
-  # Determine if expired
   if [[ "$expiration" < "$now" ]]; then
-    status="Non-Compliant"
+    # Expired — delete it
+    aws iam delete-server-certificate --server-certificate-name "$name" >/dev/null 2>&1
+    status="REMOVED"
+    ((removed_count++))
   else
     status="Compliant"
   fi
 
-  # Print table row
+  # Print result
   printf "%-30s %-20s %-15s %-25s %-15s\n" "$name" "$id" "$uid" "$expiration" "$status"
 done
+
+echo -e "\n📊 Audit Summary:"
+echo "  ➤ Total certificates checked: $total_checked"
+echo "  🗑️  Expired & removed: $removed_count"
