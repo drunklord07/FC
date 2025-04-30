@@ -1,11 +1,10 @@
 #!/bin/bash
 
-REGION="us-east-1"  # Change as needed
+REGION="us-east-1"
 
 echo -e "\nAuditing SQS queues in region: $REGION\n"
 echo -e "Queue URL\t\t\t\t\tAccount ID\t\tStatus"
 
-# Get list of SQS queues
 queue_urls=$(aws sqs list-queues --region "$REGION" --query 'QueueUrls' --output text)
 
 if [[ -z "$queue_urls" ]]; then
@@ -14,10 +13,8 @@ if [[ -z "$queue_urls" ]]; then
 fi
 
 for queue_url in $queue_urls; do
-  # Extract AWS Account ID from the queue URL
   account_id=$(echo "$queue_url" | cut -d '/' -f 4)
 
-  # Get the policy attribute as raw text
   policy=$(aws sqs get-queue-attributes \
     --region "$REGION" \
     --queue-url "$queue_url" \
@@ -25,10 +22,8 @@ for queue_url in $queue_urls; do
     --query 'Attributes.Policy' \
     --output text 2>/dev/null)
 
-  # Default status
   status="Compliant"
 
-  # Check for public access
   if [[ "$policy" != "None" && "$policy" != "null" ]]; then
     if [[ "$policy" == *'"Effect":"Allow"'* && "$policy" == *'"Principal":"*"'* ]]; then
       status="Non-Compliant"
@@ -37,6 +32,5 @@ for queue_url in $queue_urls; do
     fi
   fi
 
-  # Print result
   printf "%s\t%s\t%s\n" "$queue_url" "$account_id" "$status"
 done
