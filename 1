@@ -6,21 +6,29 @@ non_compliant_count=0
 regions=$(aws ec2 describe-regions --query 'Regions[*].RegionName' --output text)
 
 for region in $regions; do
-  # Get all SQS queues in this region
+  echo "Scanning region: $region..."
+
+  # Get all SQS queues in the region
   queue_urls=$(aws sqs list-queues --region "$region" --query 'QueueUrls' --output text 2>/dev/null)
 
   if [[ -z "$queue_urls" ]]; then
+    echo "  No queues found in $region."
     continue
   fi
 
   for queue_url in $queue_urls; do
-    # Get policy
-    raw_policy=$(aws sqs get-queue-attributes \
+    # Get policy with a 10-second timeout to avoid hanging
+    raw_policy=$(timeout 10 aws sqs get-queue-attributes \
       --region "$region" \
       --queue-url "$queue_url" \
       --attribute-names Policy \
       --query 'Attributes.Policy' \
       --output text 2>/dev/null)
+
+    if [[ $? -ne 0 ]]; then
+      echo "  ⚠️ Timeout or error fetching policy for: $queue_url"
+      continue
+    fi
 
     if [[ "$raw_policy" != "None" && "$raw_policy" != "null" ]]; then
       policy=$(echo "$raw_policy" | tr -d '[:space:]')
@@ -34,4 +42,4 @@ for region in $regions; do
   done
 done
 
-echo "Total Non-Compliant SQS Queues: $non_compliant_count"
+echo -e "\nTotal Non-Compliant SQS Queues: $non_compliant_count"
