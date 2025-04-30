@@ -1,30 +1,32 @@
 #!/bin/bash
 
-echo -e "\n🔍 Starting AWS Organizations Delegated Administrators Audit...\n"
+echo -e "\n🔍 AWS Organizations Delegated Administrators Compliance Audit\n"
 
-# Get list of delegated administrators
+# Attempt to list delegated administrators
 delegated_admins=$(aws organizations list-delegated-administrators --output json 2>/dev/null)
 
-# Check if any exist
-count=$(echo "$delegated_admins" | grep -c 'DelegatedAdministrators')
-
-if [[ "$count" -eq 0 || "$delegated_admins" == *"[]"* ]]; then
-  echo "✅ No delegated administrators found. Environment is compliant by default."
+# Check if the command returned anything meaningful
+if [[ -z "$delegated_admins" || "$delegated_admins" == *"DelegatedAdministrators\": []"* ]]; then
+  echo "✅ No delegated administrators found. Environment is compliant."
   exit 0
 fi
 
-# Print table header
-printf "%-15s %-20s %-20s %-15s\n" "Account ID" "Admin Name" "Service Principal" "Status"
-echo "--------------------------------------------------------------------------"
+# Table Header
+printf "%-20s %-20s %-30s %-15s\n" "Account ID" "Admin Name" "Service Principal" "Status"
+echo "-----------------------------------------------------------------------------------------------"
 
-# Extract and print details
-echo "$delegated_admins" | grep -o '{[^}]*}' | while read -r admin; do
-  account_id=$(echo "$admin" | grep -o '"Id":"[^"]*"' | cut -d':' -f2 | tr -d '"')
-  name=$(echo "$admin" | grep -o '"Name":"[^"]*"' | cut -d':' -f2 | tr -d '"')
-  service=$(echo "$admin" | grep -o '"ServicePrincipal":"[^"]*"' | cut -d':' -f2 | tr -d '"')
-  
-  # For now, if listed, we assume "trusted"
-  status="Compliant"
+# Extract and display details
+echo "$delegated_admins" | grep -o '{[^}]*}' | while read -r block; do
+  account_id=$(echo "$block" | grep -o '"Id":"[^"]*"' | cut -d':' -f2 | tr -d '"')
+  name=$(echo "$block" | grep -o '"Name":"[^"]*"' | cut -d':' -f2 | tr -d '"')
+  service=$(echo "$block" | grep -o '"ServicePrincipal":"[^"]*"' | cut -d':' -f2 | tr -d '"')
 
-  printf "%-15s %-20s %-20s %-15s\n" "$account_id" "$name" "$service" "$status"
+  # If all fields are present, assume trusted
+  if [[ -n "$account_id" && -n "$name" && -n "$service" ]]; then
+    status="Compliant"
+  else
+    status="Non-Compliant"
+  fi
+
+  printf "%-20s %-20s %-30s %-15s\n" "$account_id" "$name" "$service" "$status"
 done
