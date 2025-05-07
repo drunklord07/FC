@@ -1,53 +1,66 @@
 #!/bin/bash
 
-echo -e "\n🔍 Starting OpenSearch Authentication Compliance Audit...\n"
+echo "Auditing Amazon OpenSearch domains for Cognito or SAML authentication"
 
-# Print table header
-printf "%-25s %-15s %-15s %-15s %-15s\n" "Domain Name" "Region" "Account ID" "Auth Type" "Status"
-echo "---------------------------------------------------------------------------------------------"
+# Initialize counters
+TOTAL=0
+COMPLIANT=0
+NON_COMPLIANT=0
+NON_COMPLIANT_ARNS=()
 
-# Get all AWS regions
-regions=$(aws ec2 describe-regions --query 'Regions[*].RegionName' --output text)
+# Get list of domain names
+DOMAIN_NAMES=$(aws opensearch list-domain-names --query 'DomainNames[*].DomainName' --output text)
 
-for region in $regions; do
-  domains=$(aws es list-domain-names --region "$region" --query 'DomainNames[*].DomainName' --output text 2>/dev/null)
+if [ -z "$DOMAIN_NAMES" ]; then
+  echo "No OpenSearch domains found."
+  exit 0
+fi
 
-  if [[ -z "$domains" ]]; then
-    continue
+# Loop through each domain
+for DOMAIN in $DOMAIN_NAMES; do
+  ((TOTAL++))
+  echo -e "\nChecking domain: $DOMAIN"
+
+  DOMAIN_INFO=$(aws opensearch describe-domain --domain-name "$DOMAIN" --output json)
+
+  # Extract values using Python to handle null/missing keys cleanly
+  AUTH_STATUS=$(python3 -c "
+import json, sys
+data = json.loads('''$DOMAIN_INFO''')
+domain = data.get('DomainStatus', {})
+cognito = domain.get('CognitoOptions', {}).get('Enabled', False)
+saml = domain.get('SAMLOptions', {}).get('Enabled', False)
+arn = domain.get('ARN', 'unknown')
+if cognito or saml:
+    print(f'COMPLIANT|||{arn}')
+else:
+    print(f'NON_COMPLIANT|||{arn}')
+")
+
+  STATUS=$(echo "$AUTH_STATUS" | cut -d"|" -f1)
+  ARN=$(echo "$AUTH_STATUS" | cut -d"|" -f4)
+
+  if [ "$STATUS" == "COMPLIANT" ]; then
+    echo "  ✅ Authentication enabled (Cognito or SAML)"
+    ((COMPLIANT++))
+  else
+    echo "  ⚠️  No Cognito or SAML authentication enabled"
+    ((NON_COMPLIANT++))
+    NON_COMPLIANT_ARNS+=("$ARN")
   fi
-
-  for domain in $domains; do
-    # Get domain details
-    domain_details=$(aws es describe-elasticsearch-domain --region "$region" --domain-name "$domain" --output json 2>/dev/null)
-
-    # Skip if unable to fetch
-    if [[ -z "$domain_details" ]]; then
-      echo "⚠️  Could not retrieve details for domain '$domain' in $region"
-      continue
-    fi
-
-    # Check for Cognito auth
-    cognito_enabled=$(echo "$domain_details" | grep -o '"Enabled":true' | grep -c 'CognitoOptions')
-    # Check for SAML auth
-    saml_enabled=$(echo "$domain_details" | grep -A3 '"SAMLOptions"' | grep '"Enabled":true' | wc -l)
-
-    # Determine auth type
-    if [[ "$cognito_enabled" -ge 1 ]]; then
-      auth="Cognito"
-      status="Compliant"
-    elif [[ "$saml_enabled" -ge 1 ]]; then
-      auth="SAML"
-      status="Compliant"
-    else
-      auth="None"
-      status="Non-Compliant"
-    fi
-
-    # Get account ID from domain ARN
-    arn=$(echo "$domain_details" | grep -o '"ARN":"[^"]*"' | cut -d'"' -f4)
-    uid=$(echo "$arn" | cut -d':' -f5)
-
-    # Print result row
-    printf "%-25s %-15s %-15s %-15s %-15s\n" "$domain" "$region" "$uid" "$auth" "$status"
-  done
 done
+
+# Final Summary
+echo -e "\n===== AUDIT SUMMARY ====="
+echo "Total Domains:          $TOTAL"
+echo "Compliant Domains:      $COMPLIANT"
+echo "Non-Compliant Domains:  $NON_COMPLIANT"
+
+if [ "$NON_COMPLIANT" -gt 0 ]; then
+  echo -e "\nNon-Compliant Domain ARNs:"
+  for ARN in "${NON_COMPLIANT_ARNS[@]}"; do
+    echo "  - $ARN"
+  done
+else
+  echo -e "\n✅ All domains have Cognito or SAML authentication enabled."
+fi
