@@ -1,0 +1,137 @@
+#!/bin/bash
+
+REGION="us-east-1"
+echo "Auditing RDS and Aurora DBs for SSL/TLS enforcement in region: $REGION"
+
+# Initialize counters
+TOTAL=0
+COMPLIANT=0
+NON_COMPLIANT=0
+NON_COMPLIANT_ARNS=()
+
+# === Audit Standard RDS DB Instances ===
+DB_INSTANCES=$(aws rds describe-db-instances --region "$REGION" --query 'DBInstances[*].{Id:DBInstanceIdentifier,Engine:Engine,Arn:DBInstanceArn}' --output json)
+
+echo "$DB_INSTANCES" | python3 -c "
+import json
+import subprocess
+
+instances = json.load(sys.stdin)
+
+for db in instances:
+    db_id = db['Id']
+    engine = db['Engine']
+    arn = db['Arn']
+    param_name = 'rds.force_ssl' if 'postgres' in engine or 'sqlserver' in engine else 'require_secure_transport'
+
+    # Get parameter group
+    pg_cmd = [
+        'aws', 'rds', 'describe-db-instances',
+        '--region', '$REGION',
+        '--db-instance-identifier', db_id,
+        '--query', 'DBInstances[0].DBParameterGroups[0].DBParameterGroupName',
+        '--output', 'text'
+    ]
+    try:
+        param_group = subprocess.check_output(pg_cmd).decode().strip()
+    except:
+        print(f'\nDatabase: {db_id}\n  ⚠️  Error fetching parameter group')
+        continue
+
+    # Get parameter value
+    param_cmd = [
+        'aws', 'rds', 'describe-db-parameters',
+        '--region', '$REGION',
+        '--db-parameter-group-name', param_group,
+        '--query', f\"Parameters[?ParameterName=='{param_name}'].ParameterValue\",
+        '--output', 'text'
+    ]
+    try:
+        value = subprocess.check_output(param_cmd).decode().strip()
+    except:
+        value = ''
+
+    print(f'\nDatabase: {db_id}')
+    print(f'  ➤ Engine: {engine}')
+    print(f'  ➤ Parameter: {param_name} = {value if value else \"Not Set\"}')
+
+    if value in ['1', 'ON']:
+        print('  ✅ Enforces SSL')
+    else:
+        print('  ⚠️  Does NOT enforce SSL')
+        print(f'  ARN: {arn}')
+" | tee /tmp/rds_ssl_audit.txt
+
+# === Audit Aurora DB Clusters ===
+CLUSTERS=$(aws rds describe-db-clusters --region "$REGION" --query 'DBClusters[*].{Id:DBClusterIdentifier,Engine:Engine,Arn:DBClusterArn}' --output json)
+
+echo "$CLUSTERS" | python3 -c "
+import json
+import subprocess
+
+clusters = json.load(sys.stdin)
+
+for cluster in clusters:
+    cid = cluster['Id']
+    engine = cluster['Engine']
+    arn = cluster['Arn']
+    param_name = 'rds.force_ssl' if 'postgres' in engine else 'require_secure_transport'
+
+    # Get parameter group
+    pg_cmd = [
+        'aws', 'rds', 'describe-db-clusters',
+        '--region', '$REGION',
+        '--db-cluster-identifier', cid,
+        '--query', 'DBClusters[0].DBClusterParameterGroup',
+        '--output', 'text'
+    ]
+    try:
+        param_group = subprocess.check_output(pg_cmd).decode().strip()
+    except:
+        print(f'\nAurora Cluster: {cid}\n  ⚠️  Error fetching parameter group')
+        continue
+
+    # Get parameter value
+    param_cmd = [
+        'aws', 'rds', 'describe-db-cluster-parameters',
+        '--region', '$REGION',
+        '--db-cluster-parameter-group-name', param_group,
+        '--query', f\"Parameters[?ParameterName=='{param_name}'].ParameterValue\",
+        '--output', 'text'
+    ]
+    try:
+        value = subprocess.check_output(param_cmd).decode().strip()
+    except:
+        value = ''
+
+    print(f'\nAurora Cluster: {cid}')
+    print(f'  ➤ Engine: {engine}')
+    print(f'  ➤ Parameter: {param_name} = {value if value else \"Not Set\"}')
+
+    if value in ['1', 'ON']:
+        print('  ✅ Enforces SSL')
+    else:
+        print('  ⚠️  Does NOT enforce SSL')
+        print(f'  ARN: {arn}')
+" | tee -a /tmp/rds_ssl_audit.txt
+
+# === Summary (Extracted from output)
+TOTAL=$(grep -c 'Database:' /tmp/rds_ssl_audit.txt)
+TOTAL_CLUSTER=$(grep -c 'Aurora Cluster:' /tmp/rds_ssl_audit.txt)
+TOTAL=$((TOTAL + TOTAL_CLUSTER))
+COMPLIANT=$(grep -c '✅ Enforces SSL' /tmp/rds_ssl_audit.txt)
+NON_COMPLIANT=$(grep -c '⚠️  Does NOT enforce SSL' /tmp/rds_ssl_audit.txt)
+NON_COMPLIANT_ARNS=$(grep 'ARN: ' /tmp/rds_ssl_audit.txt | awk -F'ARN: ' '{print $2}')
+
+# Print Summary
+echo -e "\n===== AUDIT SUMMARY ====="
+echo "Total DB Instances/Clusters: $TOTAL"
+echo "Compliant:                   $COMPLIANT"
+echo "Non-Compliant:               $NON_COMPLIANT"
+
+if [ "$NON_COMPLIANT" -gt 0 ]; then
+  echo -e "\nNon-Compliant ARNs:"
+  echo "$NON_COMPLIANT_ARNS"
+else
+  echo -e "\n✅ All RDS and Aurora databases enforce SSL"
+fi
