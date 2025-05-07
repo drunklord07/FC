@@ -8,65 +8,65 @@ EXPIRED=0
 VALID=0
 EXPIRED_CERT_ARNS=()
 
-# Get current date in ISO 8601 format (UTC)
+# Get current UTC date in ISO format
 NOW=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
-# Get all IAM server certificates
-CERTS_JSON=$(aws iam list-server-certificates --output json)
+# Create a temp file to store JSON
+TMPFILE=$(mktemp)
+aws iam list-server-certificates --output json > "$TMPFILE"
 
-# Loop over each certificate using a Python parser to handle JSON and date comparisons
-EXPIRED_CERT_NAMES=$(python3 -c "
+# Use Python to evaluate the certs
+python3 - "$TMPFILE" "$NOW" <<'EOF'
 import json
 from datetime import datetime, timezone
 import sys
 
-certs = json.loads('''$CERTS_JSON''')
-now = datetime.strptime('$NOW', '%Y-%m-%dT%H:%M:%SZ')
+json_path = sys.argv[1]
+now_str = sys.argv[2]
+now = datetime.strptime(now_str, '%Y-%m-%dT%H:%M:%SZ')
 
-expired_names = []
+with open(json_path, 'r') as f:
+    certs = json.load(f)
+
+valid_count = 0
+expired_count = 0
+total = 0
+expired_arns = []
 
 for cert in certs.get('ServerCertificateMetadataList', []):
-    exp = cert.get('Expiration')
+    total += 1
     name = cert.get('ServerCertificateName')
     arn = cert.get('Arn')
-    if exp:
-        try:
-            exp_date = datetime.strptime(exp, '%Y-%m-%dT%H:%M:%SZ')
-            if exp_date < now:
-                print(json.dumps({'Name': name, 'Arn': arn}))
-        except Exception as e:
-            continue
-")
+    exp_str = cert.get('Expiration')
+    try:
+        exp = datetime.strptime(exp_str, '%Y-%m-%dT%H:%M:%SZ')
+        delta = (exp - now).days
+        print(f"\nCertificate: {name}")
+        print(f"  ➤ Expiration Date: {exp_str}")
+        if delta < 0:
+            print(f"  ⚠️  Status: EXPIRED ({abs(delta)} days ago)")
+            expired_count += 1
+            expired_arns.append(arn)
+        else:
+            print(f"  ✅ Status: VALID (expires in {delta} days)")
+            valid_count += 1
+    except Exception as e:
+        print(f"\nCertificate: {name}")
+        print("  ⚠️  Error parsing expiration date")
 
-# Count total certificates
-TOTAL=$(echo "$CERTS_JSON" | grep -c '"ServerCertificateName"')
+# Summary
+print("\n===== AUDIT SUMMARY =====")
+print(f"Total Certificates:     {total}")
+print(f"Valid Certificates:     {valid_count}")
+print(f"Expired Certificates:   {expired_count}")
 
-# Process expired certs (if any)
-if [ -n "$EXPIRED_CERT_NAMES" ]; then
-  echo "$EXPIRED_CERT_NAMES" | while read -r line; do
-    NAME=$(echo "$line" | python3 -c "import sys, json; print(json.load(sys.stdin)['Name'])")
-    ARN=$(echo "$line" | python3 -c "import sys, json; print(json.load(sys.stdin)['Arn'])")
-    echo -e "\nCertificate: $NAME"
-    echo "  ⚠️  EXPIRED: $ARN"
-    EXPIRED_CERT_ARNS+=("$ARN")
-    ((EXPIRED++))
-  done
-fi
+if expired_arns:
+    print("\nExpired Certificate ARNs:")
+    for arn in expired_arns:
+        print(f"  - {arn}")
+else:
+    print("\n✅ All IAM certificates are valid.")
+EOF
 
-# Calculate valid certificates
-VALID=$((TOTAL - EXPIRED))
-
-# Final summary
-echo -e "\n===== AUDIT SUMMARY ====="
-echo "Total Certificates:     $TOTAL"
-echo "Valid Certificates:     $VALID"
-echo "Expired Certificates:   $EXPIRED"
-
-if [ "$EXPIRED" -gt 0 ]; then
-  echo -e "\nExpired Certificate ARNs:"
-  for ARN in "${EXPIRED_CERT_ARNS[@]}"; do
-    echo "  - $ARN"
-  done
-else
-  echo -e "\n✅ All IAM certificates are valid."
-fi
+# Cleanup
+rm -f "$TMPFILE"
