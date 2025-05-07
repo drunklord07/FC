@@ -3,9 +3,6 @@
 echo "Auditing IAM SSL/TLS server certificates for expiration"
 
 # Initialize counters
-TOTAL=0
-EXPIRED=0
-VALID=0
 EXPIRED_CERT_ARNS=()
 
 # Get current UTC date in ISO format
@@ -15,15 +12,16 @@ NOW=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 TMPFILE=$(mktemp)
 aws iam list-server-certificates --output json > "$TMPFILE"
 
-# Use Python to evaluate the certs
+# Use Python with dateutil to evaluate the certs
 python3 - "$TMPFILE" "$NOW" <<'EOF'
 import json
+from dateutil import parser as dateparser
 from datetime import datetime, timezone
 import sys
 
 json_path = sys.argv[1]
 now_str = sys.argv[2]
-now = datetime.strptime(now_str, '%Y-%m-%dT%H:%M:%SZ')
+now = datetime.strptime(now_str, '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=timezone.utc)
 
 with open(json_path, 'r') as f:
     certs = json.load(f)
@@ -39,7 +37,7 @@ for cert in certs.get('ServerCertificateMetadataList', []):
     arn = cert.get('Arn')
     exp_str = cert.get('Expiration')
     try:
-        exp = datetime.strptime(exp_str, '%Y-%m-%dT%H:%M:%SZ')
+        exp = dateparser.parse(exp_str)
         delta = (exp - now).days
         print(f"\nCertificate: {name}")
         print(f"  ➤ Expiration Date: {exp_str}")
@@ -52,7 +50,8 @@ for cert in certs.get('ServerCertificateMetadataList', []):
             valid_count += 1
     except Exception as e:
         print(f"\nCertificate: {name}")
-        print("  ⚠️  Error parsing expiration date")
+        print(f"  ⚠️  Error parsing expiration date: {exp_str}")
+        continue
 
 # Summary
 print("\n===== AUDIT SUMMARY =====")
