@@ -1,116 +1,122 @@
 #!/bin/bash
 
 REGION="ap-south-1"
-echo "Auditing RDS and Aurora DBs for SSL/TLS enforcement in region: $REGION"
+echo "🔍 Auditing RDS and Aurora databases for SSL/TLS enforcement in region: $REGION"
 
-# Initialize temporary file
+# Initialize counters and output
 AUDIT_OUTPUT="/tmp/rds_ssl_audit.txt"
 > "$AUDIT_OUTPUT"
 
-# === Audit Standard RDS DB Instances ===
-DB_INSTANCES=$(aws rds describe-db-instances --region "$REGION" --query 'DBInstances[*].{Id:DBInstanceIdentifier,Engine:Engine,Arn:DBInstanceArn}' --output json)
+# === RDS Instances Audit ===
+echo "✅ Checking RDS DB instances..."
+DB_INSTANCES=$(aws rds describe-db-instances \
+  --region "$REGION" \
+  --query 'DBInstances[*].{Id:DBInstanceIdentifier,Engine:Engine,Arn:DBInstanceArn}' \
+  --output json)
 
-echo "$DB_INSTANCES" | python3 - <<EOF | tee -a "$AUDIT_OUTPUT"
-import json
-import subprocess
-import sys
+echo "$DB_INSTANCES" | python3 - "$REGION" <<'EOF' | tee -a "$AUDIT_OUTPUT"
+import json, subprocess, sys
 
-instances = json.load(sys.stdin)
+region = sys.argv[1]
+dbs = json.load(sys.stdin)
 
-for db in instances:
+for db in dbs:
     db_id = db['Id']
     engine = db['Engine']
     arn = db['Arn']
-    param_name = 'rds.force_ssl' if 'postgres' in engine or 'sqlserver' in engine else 'require_secure_transport'
+    param_name = "rds.force_ssl" if "postgres" in engine or "sqlserver" in engine else "require_secure_transport"
 
     try:
-        param_group = subprocess.check_output([
-            'aws', 'rds', 'describe-db-instances',
-            '--region', '$REGION',
-            '--db-instance-identifier', db_id,
-            '--query', 'DBInstances[0].DBParameterGroups[0].DBParameterGroupName',
-            '--output', 'text'
+        pg_name = subprocess.check_output([
+            "aws", "rds", "describe-db-instances",
+            "--region", region,
+            "--db-instance-identifier", db_id,
+            "--query", "DBInstances[0].DBParameterGroups[0].DBParameterGroupName",
+            "--output", "text"
         ]).decode().strip()
-    except Exception as e:
+    except:
         print(f"\nDatabase: {db_id}")
-        print("  ⚠️  Error fetching parameter group")
+        print("  ⚠️  Error fetching parameter group.")
         continue
 
     try:
-        value = subprocess.check_output([
-            'aws', 'rds', 'describe-db-parameters',
-            '--region', '$REGION',
-            '--db-parameter-group-name', param_group,
-            '--query', f"Parameters[?ParameterName=='{param_name}'].ParameterValue",
-            '--output', 'text'
-        ]).decode().strip()
-    except Exception:
-        value = ''
+        param_value = subprocess.check_output([
+            "aws", "rds", "describe-db-parameters",
+            "--region", region,
+            "--db-parameter-group-name", pg_name,
+            "--query", f"Parameters[?ParameterName=='{param_name}'].ParameterValue",
+            "--output", "text"
+        ]).decode().strip() or "Not Set"
+    except:
+        param_value = "Not Set"
 
     print(f"\nDatabase: {db_id}")
     print(f"  ➤ Engine: {engine}")
-    print(f"  ➤ Parameter: {param_name} = {value if value else 'Not Set'}")
+    print(f"  ➤ Parameter: {param_name} = {param_value}")
 
-    if value in ['1', 'ON']:
+    if param_value in ["1", "ON"]:
         print("  ✅ Enforces SSL")
     else:
         print("  ⚠️  Does NOT enforce SSL")
         print(f"  ARN: {arn}")
 EOF
 
-# === Audit Aurora DB Clusters ===
-CLUSTERS=$(aws rds describe-db-clusters --region "$REGION" --query 'DBClusters[*].{Id:DBClusterIdentifier,Engine:Engine,Arn:DBClusterArn}' --output json)
+# === Aurora Clusters Audit ===
+echo "✅ Checking Aurora DB clusters..."
+CLUSTERS=$(aws rds describe-db-clusters \
+  --region "$REGION" \
+  --query 'DBClusters[*].{Id:DBClusterIdentifier,Engine:Engine,Arn:DBClusterArn}' \
+  --output json)
 
-echo "$CLUSTERS" | python3 - <<EOF | tee -a "$AUDIT_OUTPUT"
-import json
-import subprocess
-import sys
+echo "$CLUSTERS" | python3 - "$REGION" <<'EOF' | tee -a "$AUDIT_OUTPUT"
+import json, subprocess, sys
 
+region = sys.argv[1]
 clusters = json.load(sys.stdin)
 
-for cluster in clusters:
-    cid = cluster['Id']
-    engine = cluster['Engine']
-    arn = cluster['Arn']
-    param_name = 'rds.force_ssl' if 'postgres' in engine else 'require_secure_transport'
+for cl in clusters:
+    cid = cl['Id']
+    engine = cl['Engine']
+    arn = cl['Arn']
+    param_name = "rds.force_ssl" if "postgres" in engine else "require_secure_transport"
 
     try:
-        param_group = subprocess.check_output([
-            'aws', 'rds', 'describe-db-clusters',
-            '--region', '$REGION',
-            '--db-cluster-identifier', cid,
-            '--query', 'DBClusters[0].DBClusterParameterGroup',
-            '--output', 'text'
+        pg_name = subprocess.check_output([
+            "aws", "rds", "describe-db-clusters",
+            "--region", region,
+            "--db-cluster-identifier", cid,
+            "--query", "DBClusters[0].DBClusterParameterGroup",
+            "--output", "text"
         ]).decode().strip()
-    except Exception:
+    except:
         print(f"\nAurora Cluster: {cid}")
-        print("  ⚠️  Error fetching parameter group")
+        print("  ⚠️  Error fetching parameter group.")
         continue
 
     try:
-        value = subprocess.check_output([
-            'aws', 'rds', 'describe-db-cluster-parameters',
-            '--region', '$REGION',
-            '--db-cluster-parameter-group-name', param_group,
-            '--query', f"Parameters[?ParameterName=='{param_name}'].ParameterValue",
-            '--output', 'text'
-        ]).decode().strip()
-    except Exception:
-        value = ''
+        param_value = subprocess.check_output([
+            "aws", "rds", "describe-db-cluster-parameters",
+            "--region", region,
+            "--db-cluster-parameter-group-name", pg_name,
+            "--query", f"Parameters[?ParameterName=='{param_name}'].ParameterValue",
+            "--output", "text"
+        ]).decode().strip() or "Not Set"
+    except:
+        param_value = "Not Set"
 
     print(f"\nAurora Cluster: {cid}")
     print(f"  ➤ Engine: {engine}")
-    print(f"  ➤ Parameter: {param_name} = {value if value else 'Not Set'}")
+    print(f"  ➤ Parameter: {param_name} = {param_value}")
 
-    if value in ['1', 'ON']:
+    if param_value in ["1", "ON"]:
         print("  ✅ Enforces SSL")
     else:
         print("  ⚠️  Does NOT enforce SSL")
         print(f"  ARN: {arn}")
 EOF
 
-# === Summary
-TOTAL=$(grep -c -E '^Database:|^Aurora Cluster:' "$AUDIT_OUTPUT")
+# === Summary ===
+TOTAL=$(grep -cE '^Database:|^Aurora Cluster:' "$AUDIT_OUTPUT")
 COMPLIANT=$(grep -c '✅ Enforces SSL' "$AUDIT_OUTPUT")
 NON_COMPLIANT=$(grep -c '⚠️  Does NOT enforce SSL' "$AUDIT_OUTPUT")
 NON_COMPLIANT_ARNS=$(grep 'ARN: ' "$AUDIT_OUTPUT" | awk -F'ARN: ' '{print $2}')
