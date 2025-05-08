@@ -1,0 +1,57 @@
+#!/bin/bash
+
+# Set AWS region for checking Elastic IPs
+REGION="ap-south-1"
+
+echo "🔍 Starting Route 53 Dangling A Record IP Audit (Region: $REGION)"
+
+# Get all hosted zones
+ZONE_IDS=$(aws route53 list-hosted-zones --query "HostedZones[*].Id" --output text | sed 's|/hostedzone/||g')
+
+DANGLING_IPS=()
+TOTAL_IPS=0
+CHECKED_IPS=0
+
+for ZONE_ID in $ZONE_IDS; do
+  echo -e "\n📘 Checking hosted zone: $ZONE_ID"
+
+  # Get A record IPs
+  IPS=$(aws route53 list-resource-record-sets \
+    --hosted-zone-id "$ZONE_ID" \
+    --query "ResourceRecordSets[?Type == 'A'].ResourceRecords[*].Value[]" \
+    --output text)
+
+  for IP in $IPS; do
+    ((TOTAL_IPS++))
+    echo "🔎 Checking IP: $IP"
+
+    # Check if the IP exists as an Elastic IP in the account
+    EIP_INFO=$(aws ec2 describe-addresses \
+      --region "$REGION" \
+      --query "Addresses[?PublicIp=='$IP']" \
+      --output text)
+
+    if [ -z "$EIP_INFO" ]; then
+      echo "  ⚠️  Dangling IP detected: $IP"
+      DANGLING_IPS+=("$IP")
+    else
+      echo "  ✅ IP is allocated and in use"
+    fi
+
+    ((CHECKED_IPS++))
+  done
+done
+
+# Final summary
+echo -e "\n===== AUDIT SUMMARY ====="
+echo "Total A record IPs checked:     $CHECKED_IPS"
+echo "Dangling IPs detected:          ${#DANGLING_IPS[@]}"
+
+if [ "${#DANGLING_IPS[@]}" -gt 0 ]; then
+  echo -e "\n❌ Dangling IPs:"
+  for ip in "${DANGLING_IPS[@]}"; do
+    echo "  - $ip"
+  done
+else
+  echo -e "\n✅ No dangling A record IPs found in Route 53 for region $REGION."
+fi
