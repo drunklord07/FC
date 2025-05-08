@@ -1,0 +1,97 @@
+#!/bin/bash
+
+REGION="ap-south-1"
+MAX_PARALLEL=10
+TMP_RESULT="/tmp/sns_python_audit.txt"
+> "$TMP_RESULT"
+
+echo "🔍 Scanning SNS topics in region: $REGION for public access..."
+
+# Function to check SNS topic policy using embedded Python
+check_topic() {
+  local TOPIC_ARN="$1"
+
+  POLICY=$(aws sns get-topic-attributes \
+    --region "$REGION" \
+    --topic-arn "$TOPIC_ARN" \
+    --query "Attributes.Policy" \
+    --output text 2>/dev/null)
+
+  if [[ "$POLICY" == "None" || -z "$POLICY" ]]; then
+    echo -e "PASS\t$TOPIC_ARN\tNo policy found" >> "$TMP_RESULT"
+    return
+  fi
+
+  python3 - "$TOPIC_ARN" "$TMP_RESULT" <<EOF
+import json
+import sys
+
+arn = sys.argv[1]
+outfile = sys.argv[2]
+
+try:
+    policy = json.loads("""$POLICY""")
+except json.JSONDecodeError:
+    with open(outfile, "a") as f:
+        f.write(f"FAIL\t{arn}\tPolicy JSON could not be parsed\n")
+    sys.exit(0)
+
+statements = policy.get("Statement", [])
+if not isinstance(statements, list):
+    statements = [statements]
+
+for stmt in statements:
+    if stmt.get("Effect") != "Allow":
+        continue
+    principal = stmt.get("Principal", {})
+    is_public = (
+        principal == "*" or
+        principal.get("AWS") == "*" or
+        (isinstance(principal.get("AWS"), list) and "*" in principal.get("AWS"))
+    )
+    has_condition = "Condition" in stmt
+    if is_public and not has_condition:
+        with open(outfile, "a") as f:
+            f.write(f"FAIL\t{arn}\tPublicly accessible\n")
+        break
+else:
+    with open(outfile, "a") as f:
+        f.write(f"PASS\t{arn}\tAccess restricted\n")
+EOF
+}
+
+# Get all SNS topic ARNs
+TOPIC_ARNS=$(aws sns list-topics \
+  --region "$REGION" \
+  --query "Topics[*].TopicArn" \
+  --output text)
+
+# Run checks in parallel
+JOB_COUNT=0
+for ARN in $TOPIC_ARNS; do
+  check_topic "$ARN" &
+
+  ((JOB_COUNT++))
+  if (( JOB_COUNT >= MAX_PARALLEL )); then
+    wait
+    JOB_COUNT=0
+  fi
+done
+
+wait  # Final wait
+
+# Output
+echo -e "\n===== SNS PUBLIC POLICY AUDIT REPORT ====="
+printf "STATUS\tTOPIC\tDETAIL\n"
+sort "$TMP_RESULT"
+
+TOTAL=$(wc -l < "$TMP_RESULT")
+FAILS=$(grep -c "^FAIL" "$TMP_RESULT")
+PASSES=$(grep -c "^PASS" "$TMP_RESULT")
+
+echo -e "\nSUMMARY:"
+echo "Total topics checked: $TOTAL"
+echo "PASS (restricted):    $PASSES"
+echo "FAIL (public):        $FAILS"
+
+rm -f "$TMP_RESULT"
