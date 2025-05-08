@@ -1,72 +1,59 @@
 #!/bin/bash
 
 REGION="ap-south-1"
-MAX_PARALLEL=10
-TMP_FILE="/tmp/prowler_dangling_ip_report.txt"
-> "$TMP_FILE"
+echo "🔍 Scanning Route 53 A records for dangling IPs in region: $REGION"
 
-echo "🔍 Starting Prowler-style Route 53 A record audit (Region: $REGION)..."
-
-# Function to check IP status
-check_ip() {
-  local IP="$1"
-  local NAME="$2"
-
-  MATCH=$(aws ec2 describe-addresses \
-    --region "$REGION" \
-    --filters Name=public-ip,Values="$IP" \
-    --query "Addresses[*].PublicIp" \
-    --output text)
-
-  if [ -z "$MATCH" ]; then
-    echo "FAIL\t$name\t$IP\tDangling IP (not allocated)" >> "$TMP_FILE"
-  else
-    echo "PASS\t$name\t$IP\tActive IP (allocated)" >> "$TMP_FILE"
-  fi
-}
-
-# Get hosted zones
+# Get all hosted zones
 ZONE_IDS=$(aws route53 list-hosted-zones \
   --query "HostedZones[*].Id" \
   --output text | sed 's|/hostedzone/||g')
 
-JOB_COUNT=0
+DANGLING_RECORDS=()
+TOTAL_RECORDS=0
 
 for ZONE_ID in $ZONE_IDS; do
   echo -e "\n📘 Hosted Zone: $ZONE_ID"
 
+  # Get all A records in the zone
   RECORDS=$(aws route53 list-resource-record-sets \
     --hosted-zone-id "$ZONE_ID" \
     --query "ResourceRecordSets[?Type=='A'].[Name, ResourceRecords[*].Value[]]" \
     --output text)
 
-  while read -r NAME IP; do
+  while IFS= read -r line; do
+    NAME=$(echo "$line" | awk '{print $1}')
+    IP=$(echo "$line" | awk '{print $2}')
+    
     if [[ "$IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+      ((TOTAL_RECORDS++))
       echo "🔎 $NAME -> $IP"
-      check_ip "$IP" "$NAME" &
 
-      ((JOB_COUNT++))
-      if (( JOB_COUNT >= MAX_PARALLEL )); then
-        wait
-        JOB_COUNT=0
+      # Check if IP is an EIP in the account
+      EIP_EXISTS=$(aws ec2 describe-addresses \
+        --region "$REGION" \
+        --query "Addresses[?PublicIp=='$IP']" \
+        --output text)
+
+      if [ -z "$EIP_EXISTS" ]; then
+        echo "  ⚠️  Dangling A record: $NAME -> $IP"
+        DANGLING_RECORDS+=("$NAME -> $IP")
+      else
+        echo "  ✅ IP is allocated and in use"
       fi
     fi
   done <<< "$RECORDS"
 done
 
-wait  # Final wait
+# Summary
+echo -e "\n===== AUDIT SUMMARY ====="
+echo "Total A records checked:        $TOTAL_RECORDS"
+echo "Dangling A records detected:    ${#DANGLING_RECORDS[@]}"
 
-# Output result
-echo -e "\n===== Prowler-Style DNS Dangling A Record Report ====="
-printf "STATUS\tDOMAIN\tIP\tDETAIL\n"
-sort "$TMP_FILE"
-TOTAL=$(wc -l < "$TMP_FILE")
-FAILS=$(grep -c "^FAIL" "$TMP_FILE")
-PASSES=$(grep -c "^PASS" "$TMP_FILE")
-
-echo -e "\nSUMMARY:"
-echo "Total A records checked: $TOTAL"
-echo "PASS (active IPs):       $PASSES"
-echo "FAIL (dangling IPs):     $FAILS"
-
-rm -f "$TMP_FILE"
+if [ "${#DANGLING_RECORDS[@]}" -gt 0 ]; then
+  echo -e "\n❌ Dangling A Records:"
+  for record in "${DANGLING_RECORDS[@]}"; do
+    echo "  - $record"
+  done
+else
+  echo "✅ No dangling A records found."
+fi
