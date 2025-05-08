@@ -1,11 +1,37 @@
 #!/bin/bash
 
 REGION="ap-south-1"
-echo "🔍 Checking Route 53 A records for dangling IPs in region: $REGION"
+echo "🔍 Starting parallel Route 53 A record audit for dangling EIPs in region: $REGION"
 
-# Initialize counters
-DANGLING_RECORDS=()
-TOTAL_RECORDS=0
+# Max parallel jobs at a time
+MAX_PARALLEL=10
+JOB_COUNT=0
+
+# Collect all IPs
+declare -a DANGLING_EIPS
+TOTAL_EIPS=0
+
+# Function to check if IP is a dangling EIP
+check_ip() {
+  local IP=$1
+  local NAME=$2
+
+  MATCH=$(aws ec2 describe-addresses \
+    --region "$REGION" \
+    --filters Name=public-ip,Values="$IP" \
+    --query "Addresses[*].PublicIp" \
+    --output text)
+
+  if [ -z "$MATCH" ]; then
+    echo "⚠️  Dangling A record: $NAME -> $IP"
+    echo "$NAME -> $IP" >> /tmp/dangling_ips.txt
+  else
+    echo "✅ $NAME -> $IP is allocated"
+  fi
+}
+
+# Clean previous run
+> /tmp/dangling_ips.txt
 
 # Get all hosted zone IDs
 ZONE_IDS=$(aws route53 list-hosted-zones \
@@ -13,47 +39,44 @@ ZONE_IDS=$(aws route53 list-hosted-zones \
   --output text | sed 's|/hostedzone/||g')
 
 for ZONE_ID in $ZONE_IDS; do
-  echo -e "\n📘 Hosted Zone: $ZONE_ID"
+  echo -e "\n📘 Hosted Zone ID: $ZONE_ID"
 
-  # Get all A records (IPv4)
+  # Get A records
   RECORDS=$(aws route53 list-resource-record-sets \
     --hosted-zone-id "$ZONE_ID" \
-    --query "ResourceRecordSets[?Type=='A'].[Name, ResourceRecords[*].Value[]]" \
+    --query "ResourceRecordSets[?Type == 'A'].[Name, ResourceRecords[*].Value[]]" \
     --output text)
 
-  # Parse records line by line
   while read -r NAME IP; do
     if [[ "$IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-      ((TOTAL_RECORDS++))
-      echo "🔎 Checking: $NAME -> $IP"
+      ((TOTAL_EIPS++))
+      check_ip "$IP" "$NAME" &
 
-      # Check if IP exists as Elastic IP
-      MATCH=$(aws ec2 describe-addresses \
-        --region "$REGION" \
-        --filters "Name=public-ip,Values=$IP" \
-        --query "Addresses[*].PublicIp" \
-        --output text)
-
-      if [ -z "$MATCH" ]; then
-        echo "  ⚠️  Dangling A record: $NAME -> $IP"
-        DANGLING_RECORDS+=("$NAME -> $IP")
-      else
-        echo "  ✅ IP is allocated"
+      ((JOB_COUNT++))
+      if (( JOB_COUNT >= MAX_PARALLEL )); then
+        wait
+        JOB_COUNT=0
       fi
     fi
   done <<< "$RECORDS"
 done
 
-# Final summary
-echo -e "\n===== AUDIT SUMMARY ====="
-echo "Total A records checked:        $TOTAL_RECORDS"
-echo "Dangling A records detected:    ${#DANGLING_RECORDS[@]}"
+# Final wait for any remaining jobs
+wait
 
-if [ "${#DANGLING_RECORDS[@]}" -gt 0 ]; then
+# Collect results
+mapfile -t DANGLING_EIPS < /tmp/dangling_ips.txt
+
+# Summary
+echo -e "\n===== AUDIT SUMMARY ====="
+echo "Total A records checked:        $TOTAL_EIPS"
+echo "Dangling EIPs detected:         ${#DANGLING_EIPS[@]}"
+
+if [ "${#DANGLING_EIPS[@]}" -gt 0 ]; then
   echo -e "\n❌ Dangling A Records:"
-  for r in "${DANGLING_RECORDS[@]}"; do
+  for r in "${DANGLING_EIPS[@]}"; do
     echo "  - $r"
   done
 else
-  echo "✅ No dangling A records found."
+  echo "✅ All A record IPs are linked to active EIPs."
 fi
