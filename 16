@@ -1,58 +1,58 @@
 #!/bin/bash
 
 REGION="ap-south-1"
-echo "🔍 Scanning Route 53 A records for dangling IPs in region: $REGION"
+echo "🔍 Checking Route 53 A records for dangling IPs in region: $REGION"
 
-# Get all hosted zones
+# Initialize counters
+DANGLING_RECORDS=()
+TOTAL_RECORDS=0
+
+# Get all hosted zone IDs
 ZONE_IDS=$(aws route53 list-hosted-zones \
   --query "HostedZones[*].Id" \
   --output text | sed 's|/hostedzone/||g')
 
-DANGLING_RECORDS=()
-TOTAL_RECORDS=0
-
 for ZONE_ID in $ZONE_IDS; do
   echo -e "\n📘 Hosted Zone: $ZONE_ID"
 
-  # Get all A records in the zone
+  # Get all A records (IPv4)
   RECORDS=$(aws route53 list-resource-record-sets \
     --hosted-zone-id "$ZONE_ID" \
     --query "ResourceRecordSets[?Type=='A'].[Name, ResourceRecords[*].Value[]]" \
     --output text)
 
-  while IFS= read -r line; do
-    NAME=$(echo "$line" | awk '{print $1}')
-    IP=$(echo "$line" | awk '{print $2}')
-    
+  # Parse records line by line
+  while read -r NAME IP; do
     if [[ "$IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
       ((TOTAL_RECORDS++))
-      echo "🔎 $NAME -> $IP"
+      echo "🔎 Checking: $NAME -> $IP"
 
-      # Check if IP is an EIP in the account
-      EIP_EXISTS=$(aws ec2 describe-addresses \
+      # Check if IP exists as Elastic IP
+      MATCH=$(aws ec2 describe-addresses \
         --region "$REGION" \
-        --query "Addresses[?PublicIp=='$IP']" \
+        --filters "Name=public-ip,Values=$IP" \
+        --query "Addresses[*].PublicIp" \
         --output text)
 
-      if [ -z "$EIP_EXISTS" ]; then
+      if [ -z "$MATCH" ]; then
         echo "  ⚠️  Dangling A record: $NAME -> $IP"
         DANGLING_RECORDS+=("$NAME -> $IP")
       else
-        echo "  ✅ IP is allocated and in use"
+        echo "  ✅ IP is allocated"
       fi
     fi
   done <<< "$RECORDS"
 done
 
-# Summary
+# Final summary
 echo -e "\n===== AUDIT SUMMARY ====="
 echo "Total A records checked:        $TOTAL_RECORDS"
 echo "Dangling A records detected:    ${#DANGLING_RECORDS[@]}"
 
 if [ "${#DANGLING_RECORDS[@]}" -gt 0 ]; then
   echo -e "\n❌ Dangling A Records:"
-  for record in "${DANGLING_RECORDS[@]}"; do
-    echo "  - $record"
+  for r in "${DANGLING_RECORDS[@]}"; do
+    echo "  - $r"
   done
 else
   echo "✅ No dangling A records found."
