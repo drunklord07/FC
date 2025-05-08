@@ -2,7 +2,7 @@
 
 REGION="ap-south-1"
 MAX_PARALLEL=10
-TMP_RESULT="/tmp/sns_python_audit.txt"
+TMP_RESULT="/tmp/sns_policy_audit.txt"
 > "$TMP_RESULT"
 
 echo "🔍 Scanning SNS topics in region: $REGION for public access..."
@@ -44,11 +44,11 @@ for stmt in statements:
     if stmt.get("Effect") != "Allow":
         continue
     principal = stmt.get("Principal", {})
-    is_public = (
-        principal == "*" or
-        principal.get("AWS") == "*" or
-        (isinstance(principal.get("AWS"), list) and "*" in principal.get("AWS"))
-    )
+    is_public = False
+    if principal == "*" or principal.get("AWS") == "*":
+        is_public = True
+    elif isinstance(principal.get("AWS"), list) and "*" in principal.get("AWS"):
+        is_public = True
     has_condition = "Condition" in stmt
     if is_public and not has_condition:
         with open(outfile, "a") as f:
