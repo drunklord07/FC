@@ -1,21 +1,41 @@
 #!/bin/bash
 
-# Set AWS region to check Elastic IPs
-REGION="us-east-1"
+REGION="ap-south-1"
+MAX_PARALLEL=10
+TMP_RESULT="/tmp/route53_dangling_ips.txt"
+> "$TMP_RESULT"
 
 echo "🔍 Starting Route 53 Dangling A Record IP Audit (Region: $REGION)"
 
-# Get all hosted zones
-ZONE_IDS=$(aws route53 list-hosted-zones --query "HostedZones[*].Id" --output text | sed 's|/hostedzone/||g')
+# Function to check IP and log result
+check_ip() {
+  local IP="$1"
 
-DANGLING_IPS=()
+  MATCH=$(aws ec2 describe-addresses \
+    --region "$REGION" \
+    --filters Name=public-ip,Values="$IP" \
+    --query "Addresses[*].PublicIp" \
+    --output text)
+
+  if [ -z "$MATCH" ]; then
+    echo "FAIL $IP" >> "$TMP_RESULT"
+    echo "  ⚠️  Dangling IP detected: $IP"
+  else
+    echo "PASS $IP" >> "$TMP_RESULT"
+    echo "  ✅ IP is in use and allocated"
+  fi
+}
+
+ZONE_IDS=$(aws route53 list-hosted-zones \
+  --query "HostedZones[*].Id" \
+  --output text | sed 's|/hostedzone/||g')
+
+JOB_COUNT=0
 TOTAL_IPS=0
-CHECKED_IPS=0
 
 for ZONE_ID in $ZONE_IDS; do
   echo -e "\n📘 Checking hosted zone: $ZONE_ID"
 
-  # Get A record IPs
   IPS=$(aws route53 list-resource-record-sets \
     --hosted-zone-id "$ZONE_ID" \
     --query "ResourceRecordSets[?Type == 'A'].ResourceRecords[*].Value[]" \
@@ -24,25 +44,22 @@ for ZONE_ID in $ZONE_IDS; do
   for IP in $IPS; do
     ((TOTAL_IPS++))
     echo "🔎 Checking IP: $IP"
+    check_ip "$IP" &
 
-    # Check if IP is an EIP in the specified region
-    EIP_INFO=$(aws ec2 describe-addresses \
-      --region "$REGION" \
-      --query "Addresses[?PublicIp=='$IP']" \
-      --output text)
-
-    if [ -z "$EIP_INFO" ]; then
-      echo "  ⚠️  Dangling IP detected: $IP"
-      DANGLING_IPS+=("$IP")
-    else
-      echo "  ✅ IP is in use and allocated"
+    ((JOB_COUNT++))
+    if (( JOB_COUNT >= MAX_PARALLEL )); then
+      wait
+      JOB_COUNT=0
     fi
-
-    ((CHECKED_IPS++))
   done
 done
 
+wait  # Wait for remaining jobs
+
 # Final summary
+CHECKED_IPS=$(wc -l < "$TMP_RESULT")
+DANGLING_IPS=($(grep "^FAIL" "$TMP_RESULT" | awk '{print $2}'))
+
 echo -e "\n===== AUDIT SUMMARY ====="
 echo "Total A record IPs checked:     $CHECKED_IPS"
 echo "Dangling IPs detected:          ${#DANGLING_IPS[@]}"
@@ -55,3 +72,5 @@ if [ "${#DANGLING_IPS[@]}" -gt 0 ]; then
 else
   echo -e "\n✅ No dangling A record IPs found."
 fi
+
+rm -f "$TMP_RESULT"
