@@ -1,0 +1,39 @@
+#!/bin/bash
+
+REGION="ap-south-1"
+TMP_RESULT="/tmp/rds_aurora_backtrack_audit.txt"
+> "$TMP_RESULT"
+
+echo "🔍 Auditing RDS Aurora MySQL Clusters for Backtrack configuration in region: $REGION..."
+
+# Get all DB clusters
+CLUSTERS=$(aws rds describe-db-clusters \
+  --region "$REGION" \
+  --query 'DBClusters[*].[DBClusterIdentifier,Engine,BacktrackWindow]' \
+  --output text)
+
+while read -r CLUSTER_ID ENGINE BACKTRACK; do
+  if [[ "$ENGINE" == "aurora-mysql" ]]; then
+    if [[ "$BACKTRACK" != "None" && "$BACKTRACK" != "0" ]]; then
+      echo -e "PASS\t$CLUSTER_ID\tBacktrack enabled (Window: $BACKTRACK sec)" >> "$TMP_RESULT"
+    else
+      echo -e "FAIL\t$CLUSTER_ID\tBacktrack NOT enabled" >> "$TMP_RESULT"
+    fi
+  fi
+done <<< "$CLUSTERS"
+
+# Output report
+echo -e "\n===== AURORA MYSQL BACKTRACK AUDIT ====="
+printf "STATUS\tCLUSTER\tDETAIL\n"
+sort "$TMP_RESULT"
+
+TOTAL=$(wc -l < "$TMP_RESULT")
+FAILS=$(grep -c "^FAIL" "$TMP_RESULT")
+PASSES=$(grep -c "^PASS" "$TMP_RESULT")
+
+echo -e "\nSUMMARY:"
+echo "Total Aurora MySQL clusters checked:  $TOTAL"
+echo "PASS (backtrack enabled):             $PASSES"
+echo "FAIL (no backtrack):                  $FAILS"
+
+rm -f "$TMP_RESULT"
