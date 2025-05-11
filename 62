@@ -1,0 +1,74 @@
+#!/bin/bash
+
+REGION="ap-south-1"
+TMP_RESULT="/tmp/apigateway_public_auth_audit.txt"
+> "$TMP_RESULT"
+
+echo "🔍 Auditing PUBLIC API Gateway endpoints for authorizers in region: $REGION..."
+
+# Get all REST APIs
+APIS=$(aws apigateway get-rest-apis \
+  --region "$REGION" \
+  --query 'items[*].[id,name]' \
+  --output text)
+
+while read -r API_ID API_NAME; do
+  ENDPOINT_TYPE=$(aws apigateway get-rest-api \
+    --region "$REGION" \
+    --rest-api-id "$API_ID" \
+    --query 'endpointConfiguration.types' \
+    --output text 2>/dev/null)
+
+  # Skip PRIVATE APIs
+  if echo "$ENDPOINT_TYPE" | grep -q "PRIVATE"; then
+    continue
+  fi
+
+  # It's a PUBLIC API
+  RESOURCE_IDS=$(aws apigateway get-resources \
+    --region "$REGION" \
+    --rest-api-id "$API_ID" \
+    --query 'items[*].[id,path]' \
+    --output text)
+
+  while read -r RESOURCE_ID RESOURCE_PATH; do
+    METHODS=$(aws apigateway get-resource \
+      --region "$REGION" \
+      --rest-api-id "$API_ID" \
+      --resource-id "$RESOURCE_ID" \
+      --query 'resourceMethods' \
+      --output json)
+
+    for METHOD in $(echo "$METHODS" | jq -r 'keys[]' 2>/dev/null); do
+      AUTH_TYPE=$(aws apigateway get-method \
+        --region "$REGION" \
+        --rest-api-id "$API_ID" \
+        --resource-id "$RESOURCE_ID" \
+        --http-method "$METHOD" \
+        --query 'authorizationType' \
+        --output text 2>/dev/null)
+
+      if [[ "$AUTH_TYPE" == "NONE" ]]; then
+        echo -e "FAIL\t$API_NAME\t$METHOD $RESOURCE_PATH\tNo authorizer on PUBLIC endpoint" >> "$TMP_RESULT"
+      else
+        echo -e "PASS\t$API_NAME\t$METHOD $RESOURCE_PATH\tAuth: $AUTH_TYPE" >> "$TMP_RESULT"
+      fi
+    done
+  done <<< "$RESOURCE_IDS"
+done <<< "$APIS"
+
+# Output results
+echo -e "\n===== PUBLIC API GATEWAY AUTHORIZER AUDIT ====="
+printf "STATUS\tAPI\tMETHOD\tDETAIL\n"
+sort "$TMP_RESULT"
+
+TOTAL=$(wc -l < "$TMP_RESULT")
+FAILS=$(grep -c "^FAIL" "$TMP_RESULT")
+PASSES=$(grep -c "^PASS" "$TMP_RESULT")
+
+echo -e "\nSUMMARY:"
+echo "Total public methods checked:  $TOTAL"
+echo "PASS (has authorizer):         $PASSES"
+echo "FAIL (no authorizer):          $FAILS"
+
+rm -f "$TMP_RESULT"
