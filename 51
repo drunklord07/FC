@@ -1,0 +1,59 @@
+#!/bin/bash
+
+REGION="ap-south-1"
+TMP_RESULT="/tmp/sagemaker_notebook_internet_access.txt"
+> "$TMP_RESULT"
+
+echo "🔍 Auditing SageMaker notebooks for direct internet access in region: $REGION..."
+
+# List all SageMaker notebook instances
+NOTEBOOKS=$(aws sagemaker list-notebook-instances \
+  --region "$REGION" \
+  --query 'NotebookInstances[*].NotebookInstanceName' \
+  --output text)
+
+check_notebook() {
+  local NAME="$1"
+
+  INTERNET_ACCESS=$(aws sagemaker describe-notebook-instance \
+    --region "$REGION" \
+    --notebook-instance-name "$NAME" \
+    --query 'DirectInternetAccess' \
+    --output text 2>/dev/null)
+
+  if [[ "$INTERNET_ACCESS" == "Disabled" ]]; then
+    echo -e "PASS\t$NAME\tDirect internet access disabled" >> "$TMP_RESULT"
+  else
+    echo -e "FAIL\t$NAME\tDirect internet access is ENABLED" >> "$TMP_RESULT"
+  fi
+}
+
+MAX_PARALLEL=5
+JOB_COUNT=0
+for NAME in $NOTEBOOKS; do
+  check_notebook "$NAME" &
+
+  ((JOB_COUNT++))
+  if (( JOB_COUNT >= MAX_PARALLEL )); then
+    wait
+    JOB_COUNT=0
+  fi
+done
+
+wait
+
+# Output report
+echo -e "\n===== SAGEMAKER NOTEBOOK INTERNET ACCESS AUDIT ====="
+printf "STATUS\tNOTEBOOK\tDETAIL\n"
+sort "$TMP_RESULT"
+
+TOTAL=$(wc -l < "$TMP_RESULT")
+FAILS=$(grep -c "^FAIL" "$TMP_RESULT")
+PASSES=$(grep -c "^PASS" "$TMP_RESULT")
+
+echo -e "\nSUMMARY:"
+echo "Total notebooks checked:  $TOTAL"
+echo "PASS (no direct access):  $PASSES"
+echo "FAIL (internet exposed):  $FAILS"
+
+rm -f "$TMP_RESULT"
