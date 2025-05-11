@@ -1,0 +1,59 @@
+#!/bin/bash
+
+REGION="ap-south-1"
+TMP_RESULT="/tmp/sagemaker_notebook_encryption.txt"
+> "$TMP_RESULT"
+
+echo "🔍 Auditing SageMaker notebook instances for encryption at rest in region: $REGION..."
+
+# Get all notebook instance names
+NOTEBOOKS=$(aws sagemaker list-notebook-instances \
+  --region "$REGION" \
+  --query 'NotebookInstances[*].NotebookInstanceName' \
+  --output text)
+
+check_notebook() {
+  local NAME="$1"
+
+  KMS_KEY=$(aws sagemaker describe-notebook-instance \
+    --region "$REGION" \
+    --notebook-instance-name "$NAME" \
+    --query 'KmsKeyId' \
+    --output text 2>/dev/null)
+
+  if [[ -n "$KMS_KEY" && "$KMS_KEY" != "None" ]]; then
+    echo -e "PASS\t$NAME\tEncrypted with KMS Key: $KMS_KEY" >> "$TMP_RESULT"
+  else
+    echo -e "FAIL\t$NAME\tNo KMS key configured (unencrypted)" >> "$TMP_RESULT"
+  fi
+}
+
+MAX_PARALLEL=5
+JOB_COUNT=0
+for NAME in $NOTEBOOKS; do
+  check_notebook "$NAME" &
+
+  ((JOB_COUNT++))
+  if (( JOB_COUNT >= MAX_PARALLEL )); then
+    wait
+    JOB_COUNT=0
+  fi
+done
+
+wait
+
+# Output results
+echo -e "\n===== SAGEMAKER NOTEBOOK ENCRYPTION AUDIT ====="
+printf "STATUS\tNOTEBOOK\tDETAIL\n"
+sort "$TMP_RESULT"
+
+TOTAL=$(wc -l < "$TMP_RESULT")
+FAILS=$(grep -c "^FAIL" "$TMP_RESULT")
+PASSES=$(grep -c "^PASS" "$TMP_RESULT")
+
+echo -e "\nSUMMARY:"
+echo "Total notebooks checked:  $TOTAL"
+echo "PASS (encrypted):         $PASSES"
+echo "FAIL (unencrypted):       $FAILS"
+
+rm -f "$TMP_RESULT"
