@@ -1,0 +1,59 @@
+#!/bin/bash
+
+REGION="ap-south-1"
+TMP_RESULT="/tmp/opensearch_node2node_audit.txt"
+> "$TMP_RESULT"
+
+echo "🔍 Auditing OpenSearch domains for node-to-node encryption in region: $REGION..."
+
+# List all OpenSearch domains
+DOMAINS=$(aws opensearch list-domain-names \
+  --region "$REGION" \
+  --query "DomainNames[*].DomainName" \
+  --output text)
+
+check_domain() {
+  local DOMAIN="$1"
+
+  ENCRYPTION=$(aws opensearch describe-domain \
+    --region "$REGION" \
+    --domain-name "$DOMAIN" \
+    --query "DomainStatus.NodeToNodeEncryptionOptions.Enabled" \
+    --output text 2>/dev/null)
+
+  if [[ "$ENCRYPTION" == "True" ]]; then
+    echo -e "PASS\t$DOMAIN\tNode-to-node encryption enabled" >> "$TMP_RESULT"
+  else
+    echo -e "FAIL\t$DOMAIN\tNode-to-node encryption is DISABLED or not configured" >> "$TMP_RESULT"
+  fi
+}
+
+MAX_PARALLEL=5
+JOB_COUNT=0
+for DOMAIN in $DOMAINS; do
+  check_domain "$DOMAIN" &
+
+  ((JOB_COUNT++))
+  if (( JOB_COUNT >= MAX_PARALLEL )); then
+    wait
+    JOB_COUNT=0
+  fi
+done
+
+wait
+
+# Output results
+echo -e "\n===== OPENSEARCH NODE-TO-NODE ENCRYPTION AUDIT ====="
+printf "STATUS\tDOMAIN\tDETAIL\n"
+sort "$TMP_RESULT"
+
+TOTAL=$(wc -l < "$TMP_RESULT")
+FAILS=$(grep -c "^FAIL" "$TMP_RESULT")
+PASSES=$(grep -c "^PASS" "$TMP_RESULT")
+
+echo -e "\nSUMMARY:"
+echo "Total domains checked: $TOTAL"
+echo "PASS (encryption on):  $PASSES"
+echo "FAIL (encryption off): $FAILS"
+
+rm -f "$TMP_RESULT"
