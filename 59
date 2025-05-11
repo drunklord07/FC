@@ -1,0 +1,43 @@
+#!/bin/bash
+
+REGION="ap-south-1"
+TMP_RESULT="/tmp/apigateway_endpoint_audit.txt"
+> "$TMP_RESULT"
+
+echo "🔍 Auditing API Gateway endpoints for public/private exposure in region: $REGION..."
+
+# Get all REST APIs
+APIS=$(aws apigateway get-rest-apis \
+  --region "$REGION" \
+  --query 'items[*].[id,name]' \
+  --output text)
+
+while read -r API_ID API_NAME; do
+  TYPES=$(aws apigateway get-rest-api \
+    --region "$REGION" \
+    --rest-api-id "$API_ID" \
+    --query 'endpointConfiguration.types' \
+    --output text 2>/dev/null)
+
+  if echo "$TYPES" | grep -q "PRIVATE"; then
+    echo -e "PASS\t$API_NAME\tPRIVATE endpoint" >> "$TMP_RESULT"
+  else
+    echo -e "FAIL\t$API_NAME\tPUBLIC endpoint ($TYPES)" >> "$TMP_RESULT"
+  fi
+done <<< "$APIS"
+
+# Output results
+echo -e "\n===== API GATEWAY ENDPOINT VISIBILITY AUDIT ====="
+printf "STATUS\tAPI NAME\tDETAIL\n"
+sort "$TMP_RESULT"
+
+TOTAL=$(wc -l < "$TMP_RESULT")
+FAILS=$(grep -c "^FAIL" "$TMP_RESULT")
+PASSES=$(grep -c "^PASS" "$TMP_RESULT")
+
+echo -e "\nSUMMARY:"
+echo "Total APIs checked:         $TOTAL"
+echo "PASS (private only):        $PASSES"
+echo "FAIL (public exposed APIs): $FAILS"
+
+rm -f "$TMP_RESULT"
