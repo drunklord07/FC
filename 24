@@ -1,0 +1,125 @@
+#!/bin/bash
+
+TMP_RESULT="/tmp/iam_priv_escalation_audit.txt"
+> "$TMP_RESULT"
+
+MAX_PARALLEL=10
+REGION="ap-south-1"
+
+echo "🔍 Auditing IAM customer-managed policies for privilege escalation risks..."
+
+check_policy() {
+  local POLICY_ARN="$1"
+
+  VERSION_ID=$(aws iam get-policy --policy-arn "$POLICY_ARN" \
+    --query "Policy.DefaultVersionId" \
+    --output text 2>/dev/null)
+
+  POLICY_DOC=$(aws iam get-policy-version \
+    --policy-arn "$POLICY_ARN" \
+    --version-id "$VERSION_ID" \
+    --query "PolicyVersion.Document" \
+    --output json 2>/dev/null)
+
+  python3 - "$POLICY_ARN" "$TMP_RESULT" <<EOF
+import json
+import sys
+import subprocess
+
+arn = sys.argv[1]
+outfile = sys.argv[2]
+
+RISK_ACTIONS = {
+  "iam:CreatePolicy",
+  "iam:CreateUser",
+  "iam:CreateAccessKey",
+  "iam:CreateLoginProfile",
+  "iam:AttachUserPolicy",
+  "iam:AttachGroupPolicy",
+  "iam:AttachRolePolicy",
+  "iam:PutUserPolicy",
+  "iam:PutRolePolicy",
+  "iam:UpdateAssumeRolePolicy",
+  "iam:PassRole",
+  "sts:AssumeRole"
+}
+
+try:
+    policy = json.loads('''$POLICY_DOC''')
+except Exception as e:
+    with open(outfile, 'a') as f:
+        f.write(f"FAIL\t{arn}\tInvalid JSON or could not parse: {str(e)}\n")
+    sys.exit(0)
+
+statements = policy.get("Statement", [])
+if not isinstance(statements, list):
+    statements = [statements]
+
+flagged = False
+for stmt in statements:
+    if stmt.get("Effect") != "Allow":
+        continue
+
+    actions = stmt.get("Action", [])
+    if isinstance(actions, str):
+        actions = [actions]
+
+    for action in actions:
+        if action == "*" or any(action.lower() == r.lower() for r in RISK_ACTIONS):
+            flagged = True
+            break
+    if flagged:
+        break
+
+if flagged:
+    attached = subprocess.getoutput(
+        f"aws iam list-entities-for-policy --policy-arn {arn} --query 'PolicyUsers || PolicyGroups || PolicyRoles' --output text"
+    ).strip()
+
+    with open(outfile, "a") as f:
+        if attached:
+            f.write(f"FAIL\t{arn}\tContains privilege escalation action(s) and is attached\n")
+        else:
+            f.write(f"WARNING\t{arn}\tContains privilege escalation action(s) but NOT attached\n")
+else:
+    with open(outfile, "a") as f:
+        f.write(f"PASS\t{arn}\tNo privilege escalation risk found\n")
+EOF
+}
+
+# List all customer-managed IAM policies
+POLICY_ARNS=$(aws iam list-policies \
+  --scope Local \
+  --query "Policies[*].Arn" \
+  --output text)
+
+JOB_COUNT=0
+for POLICY_ARN in $POLICY_ARNS; do
+  check_policy "$POLICY_ARN" &
+
+  ((JOB_COUNT++))
+  if (( JOB_COUNT >= MAX_PARALLEL )); then
+    wait
+    JOB_COUNT=0
+  fi
+done
+
+wait
+
+# Report
+echo -e "\n===== PRIVILEGE ESCALATION POLICY AUDIT ====="
+printf "STATUS\tPOLICY_ARN\tDETAIL\n"
+sort "$TMP_RESULT"
+
+TOTAL=$(wc -l < "$TMP_RESULT")
+FAILS=$(grep -c "^FAIL" "$TMP_RESULT")
+WARNS=$(grep -c "^WARNING" "$TMP_RESULT")
+PASSES=$(grep -c "^PASS" "$TMP_RESULT")
+
+echo -e "\nSUMMARY:"
+echo "Total policies checked:   $TOTAL"
+echo "FAIL (risk + attached):   $FAILS"
+echo "WARNING (risk, not used): $WARNS"
+echo "PASS (safe):              $PASSES"
+
+rm -f "$TMP_RESULT"
