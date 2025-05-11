@@ -1,0 +1,61 @@
+#!/bin/bash
+
+echo "🔍 Auditing centralized root credentials management in AWS Organizations..."
+
+TMP_ACCOUNTS="/tmp/aws_accounts.txt"
+TMP_POLICY_ACCOUNTS="/tmp/scp_root_protected_accounts.txt"
+> "$TMP_ACCOUNTS"
+> "$TMP_POLICY_ACCOUNTS"
+
+# Step 1: List all active AWS Organization accounts
+echo "📘 Fetching active member accounts..."
+aws organizations list-accounts \
+  --query "Accounts[?Status=='ACTIVE'].[Id,Email]" \
+  --output text > "$TMP_ACCOUNTS"
+
+# Step 2: List all SCPs
+echo "📘 Scanning Service Control Policies for root restrictions..."
+POLICIES=$(aws organizations list-policies --filter SERVICE_CONTROL_POLICY --query "Policies[*].[Id,Name]" --output text)
+
+# Step 3: Look for SCPs that explicitly deny root user
+for POLICY_ID in $(echo "$POLICIES" | awk '{print $1}'); do
+  DOCUMENT=$(aws organizations describe-policy --policy-id "$POLICY_ID" --query "Policy.Content" --output text)
+
+  echo "$DOCUMENT" | python3 -c "
+import sys, json
+doc = json.loads(sys.stdin.read())
+statements = doc.get('Statement', [])
+if not isinstance(statements, list):
+    statements = [statements]
+for stmt in statements:
+    if (
+        stmt.get('Effect') == 'Deny' and
+        stmt.get('Principal', {}).get('AWS', '').endswith(':root')
+    ):
+        print('MATCH')
+        break
+" > /dev/null
+
+  if [ $? -eq 0 ]; then
+    # If this policy blocks root, get its attached accounts
+    echo "✅ Found SCP blocking root: $POLICY_ID"
+    aws organizations list-targets-for-policy --policy-id "$POLICY_ID" \
+      --query "Targets[?Type=='ACCOUNT'].TargetId" \
+      --output text >> "$TMP_POLICY_ACCOUNTS"
+  fi
+done
+
+# Step 4: Report
+echo -e "\n===== ROOT ACCESS AUDIT REPORT ====="
+echo -e "AccountID\tStatus"
+
+sort "$TMP_ACCOUNTS" | while read -r ACCOUNT_ID EMAIL; do
+  if grep -q "$ACCOUNT_ID" "$TMP_POLICY_ACCOUNTS"; then
+    echo -e "$ACCOUNT_ID\t✅ Root blocked via SCP"
+  else
+    echo -e "$ACCOUNT_ID\t❌ No SCP blocking root"
+  fi
+done
+
+# Cleanup
+rm -f "$TMP_ACCOUNTS" "$TMP_POLICY_ACCOUNTS"
