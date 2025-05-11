@@ -1,0 +1,64 @@
+#!/bin/bash
+
+REGION="ap-south-1"
+TMP_RESULT="/tmp/vpn_tunnel_status_audit.txt"
+> "$TMP_RESULT"
+
+echo "🔍 Auditing VPN tunnel availability in region: $REGION..."
+
+# Get all VPN connection IDs
+VPN_IDS=$(aws ec2 describe-vpn-connections \
+  --region "$REGION" \
+  --query "VpnConnections[*].VpnConnectionId" \
+  --output text)
+
+check_vpn() {
+  local VPN_ID="$1"
+
+  STATUSES=$(aws ec2 describe-vpn-connections \
+    --region "$REGION" \
+    --vpn-connection-ids "$VPN_ID" \
+    --query "VpnConnections[0].VgwTelemetry[*].Status" \
+    --output text 2>/dev/null)
+
+  UP_COUNT=0
+  for STATUS in $STATUSES; do
+    [[ "$STATUS" == "UP" ]] && ((UP_COUNT++))
+  done
+
+  if [[ "$UP_COUNT" -eq 2 ]]; then
+    echo -e "PASS\t$VPN_ID\tBoth tunnels UP" >> "$TMP_RESULT"
+  else
+    echo -e "FAIL\t$VPN_ID\tOnly $UP_COUNT tunnel(s) UP" >> "$TMP_RESULT"
+  fi
+}
+
+MAX_PARALLEL=10
+JOB_COUNT=0
+for VPN_ID in $VPN_IDS; do
+  check_vpn "$VPN_ID" &
+
+  ((JOB_COUNT++))
+  if (( JOB_COUNT >= MAX_PARALLEL )); then
+    wait
+    JOB_COUNT=0
+  fi
+done
+
+wait
+
+# Output results
+echo -e "\n===== VPN TUNNEL AVAILABILITY AUDIT ====="
+printf "STATUS\tVPN_ID\tDETAIL\n"
+sort "$TMP_RESULT"
+
+TOTAL=$(wc -l < "$TMP_RESULT")
+FAILS=$(grep -c "^FAIL" "$TMP_RESULT")
+PASSES=$(grep -c "^PASS" "$TMP_RESULT")
+
+echo -e "\nSUMMARY:"
+echo "Total VPN connections checked: $TOTAL"
+echo "PASS (both tunnels UP):        $PASSES"
+echo "FAIL (one or both DOWN):       $FAILS"
+
+rm -f "$TMP_RESULT"
