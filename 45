@@ -1,0 +1,64 @@
+#!/bin/bash
+
+REGION="ap-south-1"
+TMP_RESULT="/tmp/opensearch_logging_prowler.txt"
+> "$TMP_RESULT"
+
+echo "🔍 Auditing OpenSearch domains for Prowler-aligned log settings in region: $REGION..."
+
+# List all OpenSearch domains
+DOMAINS=$(aws opensearch list-domain-names \
+  --region "$REGION" \
+  --query "DomainNames[*].DomainName" \
+  --output text)
+
+check_logs() {
+  local DOMAIN="$1"
+
+  LOGS=$(aws opensearch describe-domain \
+    --region "$REGION" \
+    --domain-name "$DOMAIN" \
+    --query "DomainStatus.LogPublishingOptions" \
+    --output json 2>/dev/null)
+
+  ES=$(echo "$LOGS" | grep -c '"ES_APPLICATION_LOGS": {[^}]*"Enabled": true')
+  INDEX=$(echo "$LOGS" | grep -c '"INDEX_SLOW_LOGS": {[^}]*"Enabled": true')
+  SEARCH=$(echo "$LOGS" | grep -c '"SEARCH_SLOW_LOGS": {[^}]*"Enabled": true')
+  AUDIT=$(echo "$LOGS" | grep -c '"AUDIT_LOGS": {[^}]*"Enabled": true')
+
+  if [[ "$ES" -eq 1 && "$INDEX" -eq 1 && "$SEARCH" -eq 1 && "$AUDIT" -eq 1 ]]; then
+    echo -e "PASS\t$DOMAIN\tAll 4 logs enabled (Prowler-aligned)" >> "$TMP_RESULT"
+  else
+    echo -e "FAIL\t$DOMAIN\tMissing logs: ES=$ES, INDEX=$INDEX, SEARCH=$SEARCH, AUDIT=$AUDIT" >> "$TMP_RESULT"
+  fi
+}
+
+MAX_PARALLEL=5
+JOB_COUNT=0
+for DOMAIN in $DOMAINS; do
+  check_logs "$DOMAIN" &
+
+  ((JOB_COUNT++))
+  if (( JOB_COUNT >= MAX_PARALLEL )); then
+    wait
+    JOB_COUNT=0
+  fi
+done
+
+wait
+
+# Report
+echo -e "\n===== OPENSEARCH LOGGING (PROWLER-STYLE) AUDIT ====="
+printf "STATUS\tDOMAIN\tDETAIL\n"
+sort "$TMP_RESULT"
+
+TOTAL=$(wc -l < "$TMP_RESULT")
+FAILS=$(grep -c "^FAIL" "$TMP_RESULT")
+PASSES=$(grep -c "^PASS" "$TMP_RESULT")
+
+echo -e "\nSUMMARY:"
+echo "Total domains checked: $TOTAL"
+echo "PASS (all logs on):    $PASSES"
+echo "FAIL (some missing):   $FAILS"
+
+rm -f "$TMP_RESULT"
