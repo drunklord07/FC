@@ -1,0 +1,112 @@
+#!/bin/bash
+
+TMP_RESULT="/tmp/iam_full_access_audit.txt"
+> "$TMP_RESULT"
+
+MAX_PARALLEL=10
+REGION="ap-south-1"
+
+echo "🔍 Auditing IAM customer-managed policies for unrestricted '*:*' permissions..."
+
+check_policy() {
+  local POLICY_ARN="$1"
+
+  # Get default version ID
+  VERSION_ID=$(aws iam get-policy --policy-arn "$POLICY_ARN" \
+    --query "Policy.DefaultVersionId" \
+    --output text 2>/dev/null)
+
+  # Get policy document
+  POLICY_DOC=$(aws iam get-policy-version \
+    --policy-arn "$POLICY_ARN" \
+    --version-id "$VERSION_ID" \
+    --query "PolicyVersion.Document" \
+    --output json 2>/dev/null)
+
+  # Pass to Python to check for *:* permissions
+  python3 - "$POLICY_ARN" "$TMP_RESULT" <<EOF
+import sys, json
+arn = sys.argv[1]
+outfile = sys.argv[2]
+
+try:
+    policy = json.loads('''$POLICY_DOC''')
+except:
+    with open(outfile, 'a') as f:
+        f.write(f"FAIL\t{arn}\tInvalid JSON\n")
+    sys.exit(0)
+
+statements = policy.get("Statement", [])
+if not isinstance(statements, list):
+    statements = [statements]
+
+for stmt in statements:
+    if stmt.get("Effect") != "Allow":
+        continue
+
+    actions = stmt.get("Action", [])
+    resources = stmt.get("Resource", [])
+
+    if isinstance(actions, str):
+        actions = [actions]
+    if isinstance(resources, str):
+        resources = [resources]
+
+    if "*" in actions and "*" in resources:
+        # Check if policy is attached
+        from subprocess import check_output
+        attached = check_output([
+            "aws", "iam", "list-entities-for-policy",
+            "--policy-arn", arn,
+            "--query", "PolicyUsers || PolicyGroups || PolicyRoles",
+            "--output", "text"
+        ]).decode().strip()
+
+        with open(outfile, "a") as f:
+            if attached:
+                f.write(f"FAIL\t{arn}\tFull '*:*' and attached\n")
+            else:
+                f.write(f"WARNING\t{arn}\tFull '*:*' but NOT attached\n")
+        break
+else:
+    with open(outfile, "a") as f:
+        f.write(f"PASS\t{arn}\tNo full '*:*' access\n")
+EOF
+}
+
+# List all customer-managed IAM policies
+POLICY_ARNS=$(aws iam list-policies \
+  --scope Local \
+  --query "Policies[*].Arn" \
+  --output text)
+
+JOB_COUNT=0
+for POLICY_ARN in $POLICY_ARNS; do
+  check_policy "$POLICY_ARN" &
+
+  ((JOB_COUNT++))
+  if (( JOB_COUNT >= MAX_PARALLEL )); then
+    wait
+    JOB_COUNT=0
+  fi
+done
+
+wait
+
+# Report
+echo -e "\n===== CUSTOMER-MANAGED IAM POLICY AUDIT ====="
+printf "STATUS\tPOLICY_ARN\tDETAIL\n"
+sort "$TMP_RESULT"
+
+TOTAL=$(wc -l < "$TMP_RESULT")
+FAILS=$(grep -c "^FAIL" "$TMP_RESULT")
+WARNS=$(grep -c "^WARNING" "$TMP_RESULT")
+PASSES=$(grep -c "^PASS" "$TMP_RESULT")
+
+echo -e "\nSUMMARY:"
+echo "Total policies checked:   $TOTAL"
+echo "FAIL (attached *:*):      $FAILS"
+echo "WARNING (unattached *:*): $WARNS"
+echo "PASS (compliant):         $PASSES"
+
+rm -f "$TMP_RESULT"
