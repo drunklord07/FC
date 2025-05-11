@@ -1,0 +1,55 @@
+#!/bin/bash
+
+REGION="ap-south-1"
+TMP_RESULT="/tmp/apigateway_logging_audit.txt"
+> "$TMP_RESULT"
+
+echo "🔍 Auditing API Gateway stages for logging configuration in region: $REGION..."
+
+# Get all REST APIs
+APIS=$(aws apigateway get-rest-apis \
+  --region "$REGION" \
+  --query 'items[*].[id,name]' \
+  --output text)
+
+while read -r API_ID API_NAME; do
+  STAGES=$(aws apigateway get-stages \
+    --region "$REGION" \
+    --rest-api-id "$API_ID" \
+    --query 'item[*].stageName' \
+    --output text)
+
+  for STAGE in $STAGES; do
+    METHOD_SETTINGS=$(aws apigateway get-stage \
+      --region "$REGION" \
+      --rest-api-id "$API_ID" \
+      --stage-name "$STAGE" \
+      --query 'methodSettings."*/*"' \
+      --output json 2>/dev/null)
+
+    LOG_LEVEL=$(echo "$METHOD_SETTINGS" | grep -o '"loggingLevel": *"[^"]*"' | cut -d'"' -f4)
+    TRACE_ENABLED=$(echo "$METHOD_SETTINGS" | grep -o '"dataTraceEnabled": *[^,}]*' | awk -F: '{print $2}' | tr -d ' ')
+
+    if [[ "$LOG_LEVEL" == "INFO" || "$LOG_LEVEL" == "ERROR" ]]; then
+      echo -e "PASS\t$API_NAME ($STAGE)\tLogging enabled (Level: $LOG_LEVEL, Trace: $TRACE_ENABLED)" >> "$TMP_RESULT"
+    else
+      echo -e "FAIL\t$API_NAME ($STAGE)\tLogging not properly enabled" >> "$TMP_RESULT"
+    fi
+  done
+done <<< "$APIS"
+
+# Output results
+echo -e "\n===== API GATEWAY LOGGING AUDIT ====="
+printf "STATUS\tSTAGE\tDETAIL\n"
+sort "$TMP_RESULT"
+
+TOTAL=$(wc -l < "$TMP_RESULT")
+FAILS=$(grep -c "^FAIL" "$TMP_RESULT")
+PASSES=$(grep -c "^PASS" "$TMP_RESULT")
+
+echo -e "\nSUMMARY:"
+echo "Total stages checked:     $TOTAL"
+echo "PASS (logging enabled):   $PASSES"
+echo "FAIL (logging disabled):  $FAILS"
+
+rm -f "$TMP_RESULT"
