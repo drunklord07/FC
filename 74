@@ -1,0 +1,67 @@
+#!/bin/bash
+
+REGION="ap-south-1"
+TMP_RESULT="/tmp/rds_backup_plan_audit.txt"
+> "$TMP_RESULT"
+
+echo "🔍 Auditing RDS Clusters for AWS Backup plan protection in region: $REGION..."
+
+# Get all DB clusters
+readarray -t CLUSTERS < <(aws rds describe-db-clusters \
+  --region "$REGION" \
+  --query 'DBClusters[*].[DBClusterIdentifier,DBClusterArn]' \
+  --output text)
+
+# Get all backup plans
+PLAN_IDS=$(aws backup list-backup-plans \
+  --region "$REGION" \
+  --query 'BackupPlansList[*].BackupPlanId' \
+  --output text)
+
+# Collect all protected RDS ARNs from backup selections
+PROTECTED_ARNS=()
+for PLAN_ID in $PLAN_IDS; do
+  SELECTIONS=$(aws backup list-backup-selections \
+    --region "$REGION" \
+    --backup-plan-id "$PLAN_ID" \
+    --query 'BackupSelectionsList[*].SelectionId' \
+    --output text)
+
+  for SELECTION_ID in $SELECTIONS; do
+    ARNS=$(aws backup get-backup-selection \
+      --region "$REGION" \
+      --backup-plan-id "$PLAN_ID" \
+      --selection-id "$SELECTION_ID" \
+      --query 'BackupSelection.Resources' \
+      --output text)
+    PROTECTED_ARNS+=($ARNS)
+  done
+done
+
+# Check each DB Cluster against protected list
+for ENTRY in "${CLUSTERS[@]}"; do
+  CLUSTER_ID=$(echo "$ENTRY" | awk '{print $1}')
+  CLUSTER_ARN=$(echo "$ENTRY" | awk '{print $2}')
+
+  if printf '%s\n' "${PROTECTED_ARNS[@]}" | grep -q "$CLUSTER_ARN"; then
+    echo -e "PASS\t$CLUSTER_ID\tProtected by AWS Backup Plan" >> "$TMP_RESULT"
+  else
+    echo -e "FAIL\t$CLUSTER_ID\tNOT protected by any AWS Backup Plan" >> "$TMP_RESULT"
+  fi
+done
+
+# Output results
+echo -e "\n===== RDS CLUSTER BACKUP PLAN AUDIT ====="
+printf "STATUS\tCLUSTER\tDETAIL\n"
+sort "$TMP_RESULT"
+
+TOTAL=$(wc -l < "$TMP_RESULT")
+FAILS=$(grep -c "^FAIL" "$TMP_RESULT")
+PASSES=$(grep -c "^PASS" "$TMP_RESULT")
+
+echo -e "\nSUMMARY:"
+echo "Total RDS Clusters checked:    $TOTAL"
+echo "PASS (covered by backup plan): $PASSES"
+echo "FAIL (not covered):            $FAILS"
+
+rm -f "$TMP_RESULT"
