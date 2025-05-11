@@ -1,0 +1,59 @@
+#!/bin/bash
+
+REGION="ap-south-1"
+TMP_RESULT="/tmp/sagemaker_network_isolation.txt"
+> "$TMP_RESULT"
+
+echo "🔍 Auditing SageMaker models for network isolation in region: $REGION..."
+
+# Get all SageMaker model names
+MODEL_NAMES=$(aws sagemaker list-models \
+  --region "$REGION" \
+  --query 'Models[*].ModelName' \
+  --output text)
+
+check_model() {
+  local MODEL="$1"
+
+  ISOLATION=$(aws sagemaker describe-model \
+    --region "$REGION" \
+    --model-name "$MODEL" \
+    --query 'EnableNetworkIsolation' \
+    --output text 2>/dev/null)
+
+  if [[ "$ISOLATION" == "True" ]]; then
+    echo -e "PASS\t$MODEL\tNetwork isolation ENABLED" >> "$TMP_RESULT"
+  else
+    echo -e "FAIL\t$MODEL\tNetwork isolation DISABLED or not configured" >> "$TMP_RESULT"
+  fi
+}
+
+MAX_PARALLEL=5
+JOB_COUNT=0
+for MODEL in $MODEL_NAMES; do
+  check_model "$MODEL" &
+
+  ((JOB_COUNT++))
+  if (( JOB_COUNT >= MAX_PARALLEL )); then
+    wait
+    JOB_COUNT=0
+  fi
+done
+
+wait
+
+# Report
+echo -e "\n===== SAGEMAKER MODEL NETWORK ISOLATION AUDIT ====="
+printf "STATUS\tMODEL\tDETAIL\n"
+sort "$TMP_RESULT"
+
+TOTAL=$(wc -l < "$TMP_RESULT")
+FAILS=$(grep -c "^FAIL" "$TMP_RESULT")
+PASSES=$(grep -c "^PASS" "$TMP_RESULT")
+
+echo -e "\nSUMMARY:"
+echo "Total models checked:    $TOTAL"
+echo "PASS (isolated):         $PASSES"
+echo "FAIL (not isolated):     $FAILS"
+
+rm -f "$TMP_RESULT"
