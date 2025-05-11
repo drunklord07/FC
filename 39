@@ -1,0 +1,52 @@
+#!/bin/bash
+
+REGION="ap-south-1"
+TMP_RESULT="/tmp/well_architected_risks.txt"
+> "$TMP_RESULT"
+
+echo "🔍 Auditing AWS Well-Architected workloads for medium/high risks in region: $REGION..."
+
+# Get all workload IDs
+WORKLOADS=$(aws wellarchitected list-workloads \
+  --region "$REGION" \
+  --query "WorkloadSummaries[*].[WorkloadId,WorkloadName]" \
+  --output text)
+
+while read -r WORKLOAD_ID WORKLOAD_NAME; do
+  LATEST_LENS=$(aws wellarchitected list-lenses \
+    --region "$REGION" \
+    --query "LensSummaries[?LensName=='WellArchitected'].LensAlias" \
+    --output text)
+
+  # Get risk counts for the WA lens only
+  RISK_COUNTS=$(aws wellarchitected get-workload \
+    --region "$REGION" \
+    --workload-id "$WORKLOAD_ID" \
+    --query "[RiskCounts.HIGH, RiskCounts.MEDIUM]" \
+    --output text)
+
+  HIGH=$(echo "$RISK_COUNTS" | awk '{print $1}')
+  MEDIUM=$(echo "$RISK_COUNTS" | awk '{print $2}')
+
+  if [[ "$HIGH" -gt 0 || "$MEDIUM" -gt 0 ]]; then
+    echo -e "FAIL\t$WORKLOAD_NAME\tHigh: $HIGH, Medium: $MEDIUM" >> "$TMP_RESULT"
+  else
+    echo -e "PASS\t$WORKLOAD_NAME\tNo medium or high risk issues" >> "$TMP_RESULT"
+  fi
+done <<< "$WORKLOADS"
+
+# Output report
+echo -e "\n===== WELL-ARCHITECTED RISK AUDIT ====="
+printf "STATUS\tWORKLOAD\tDETAIL\n"
+sort "$TMP_RESULT"
+
+TOTAL=$(wc -l < "$TMP_RESULT")
+FAILS=$(grep -c "^FAIL" "$TMP_RESULT")
+PASSES=$(grep -c "^PASS" "$TMP_RESULT")
+
+echo -e "\nSUMMARY:"
+echo "Total workloads checked: $TOTAL"
+echo "PASS (clean):            $PASSES"
+echo "FAIL (risks present):    $FAILS"
+
+rm -f "$TMP_RESULT"
