@@ -1,0 +1,52 @@
+#!/bin/bash
+
+REGION="ap-south-1"
+TMP_RESULT="/tmp/apigateway_client_cert_audit.txt"
+> "$TMP_RESULT"
+
+echo "🔍 Auditing API Gateway stages for client certificate configuration in region: $REGION..."
+
+# Get all REST APIs
+APIS=$(aws apigateway get-rest-apis \
+  --region "$REGION" \
+  --query 'items[*].[id,name]' \
+  --output text)
+
+while read -r API_ID API_NAME; do
+  STAGES=$(aws apigateway get-stages \
+    --region "$REGION" \
+    --rest-api-id "$API_ID" \
+    --query 'item[*].stageName' \
+    --output text)
+
+  for STAGE in $STAGES; do
+    CERT_ID=$(aws apigateway get-stage \
+      --region "$REGION" \
+      --rest-api-id "$API_ID" \
+      --stage-name "$STAGE" \
+      --query 'clientCertificateId' \
+      --output text 2>/dev/null)
+
+    if [[ "$CERT_ID" != "None" && -n "$CERT_ID" ]]; then
+      echo -e "PASS\t$API_NAME ($STAGE)\tClient certificate enabled: $CERT_ID" >> "$TMP_RESULT"
+    else
+      echo -e "FAIL\t$API_NAME ($STAGE)\tClient certificate NOT enabled" >> "$TMP_RESULT"
+    fi
+  done
+done <<< "$APIS"
+
+# Output results
+echo -e "\n===== API GATEWAY CLIENT CERTIFICATE AUDIT ====="
+printf "STATUS\tSTAGE\tDETAIL\n"
+sort "$TMP_RESULT"
+
+TOTAL=$(wc -l < "$TMP_RESULT")
+FAILS=$(grep -c "^FAIL" "$TMP_RESULT")
+PASSES=$(grep -c "^PASS" "$TMP_RESULT")
+
+echo -e "\nSUMMARY:"
+echo "Total stages checked:        $TOTAL"
+echo "PASS (cert enabled):         $PASSES"
+echo "FAIL (no client cert):       $FAILS"
+
+rm -f "$TMP_RESULT"
