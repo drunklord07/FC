@@ -1,0 +1,63 @@
+#!/bin/bash
+
+REGION="ap-south-1"
+TMP_RESULT="/tmp/sagemaker_training_vpc_audit.txt"
+> "$TMP_RESULT"
+
+echo "🔍 Auditing SageMaker training jobs for VPC configuration in region: $REGION..."
+
+# Get recent SageMaker training jobs (latest 100)
+TRAINING_JOBS=$(aws sagemaker list-training-jobs \
+  --region "$REGION" \
+  --max-items 100 \
+  --query 'TrainingJobSummaries[*].TrainingJobName' \
+  --output text)
+
+check_vpc() {
+  local JOB="$1"
+
+  VPC_JSON=$(aws sagemaker describe-training-job \
+    --region "$REGION" \
+    --training-job-name "$JOB" \
+    --query 'VpcConfig' \
+    --output json 2>/dev/null)
+
+  SUBNET_COUNT=$(echo "$VPC_JSON" | grep -o '"subnet-[^"]*"' | wc -l)
+  SG_COUNT=$(echo "$VPC_JSON" | grep -o '"sg-[^"]*"' | wc -l)
+
+  if [[ "$SUBNET_COUNT" -gt 0 && "$SG_COUNT" -gt 0 ]]; then
+    echo -e "PASS\t$JOB\tVPC configured: $SUBNET_COUNT subnet(s), $SG_COUNT SG(s)" >> "$TMP_RESULT"
+  else
+    echo -e "FAIL\t$JOB\tMissing or incomplete VPC config" >> "$TMP_RESULT"
+  fi
+}
+
+MAX_PARALLEL=5
+JOB_COUNT=0
+for JOB in $TRAINING_JOBS; do
+  check_vpc "$JOB" &
+
+  ((JOB_COUNT++))
+  if (( JOB_COUNT >= MAX_PARALLEL )); then
+    wait
+    JOB_COUNT=0
+  fi
+done
+
+wait
+
+# Output results
+echo -e "\n===== SAGEMAKER TRAINING JOB VPC CONFIG AUDIT ====="
+printf "STATUS\tJOB\tDETAIL\n"
+sort "$TMP_RESULT"
+
+TOTAL=$(wc -l < "$TMP_RESULT")
+FAILS=$(grep -c "^FAIL" "$TMP_RESULT")
+PASSES=$(grep -c "^PASS" "$TMP_RESULT")
+
+echo -e "\nSUMMARY:"
+echo "Total jobs checked:      $TOTAL"
+echo "PASS (VPC configured):   $PASSES"
+echo "FAIL (no VPC settings):  $FAILS"
+
+rm -f "$TMP_RESULT"
