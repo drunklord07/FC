@@ -1,0 +1,47 @@
+#!/bin/bash
+
+REGION="ap-south-1"
+TMP_RESULT="/tmp/workspaces_encryption_audit.txt"
+> "$TMP_RESULT"
+
+echo "🔍 Auditing Amazon WorkSpaces volume encryption in region: $REGION..."
+
+# Get all Workspace IDs
+WORKSPACES=$(aws workspaces describe-workspaces \
+  --region "$REGION" \
+  --query 'Workspaces[*].WorkspaceId' \
+  --output text)
+
+# Check each WorkSpace
+for WS_ID in $WORKSPACES; do
+  INFO=$(aws workspaces describe-workspaces \
+    --region "$REGION" \
+    --workspace-ids "$WS_ID" \
+    --query 'Workspaces[*].[RootVolumeEncryptionEnabled, UserVolumeEncryptionEnabled]' \
+    --output text 2>/dev/null)
+
+  ROOT_ENCRYPTED=$(echo "$INFO" | awk '{print $1}')
+  USER_ENCRYPTED=$(echo "$INFO" | awk '{print $2}')
+
+  if [[ "$ROOT_ENCRYPTED" == "True" && "$USER_ENCRYPTED" == "True" ]]; then
+    echo -e "PASS\t$WS_ID\tRoot and User volumes encrypted" >> "$TMP_RESULT"
+  else
+    echo -e "FAIL\t$WS_ID\tRootEncrypted=$ROOT_ENCRYPTED, UserEncrypted=$USER_ENCRYPTED" >> "$TMP_RESULT"
+  fi
+done
+
+# Output
+echo -e "\n===== WORKSPACES ENCRYPTION AUDIT ====="
+printf "STATUS\tWORKSPACE_ID\tDETAIL\n"
+sort "$TMP_RESULT"
+
+TOTAL=$(wc -l < "$TMP_RESULT")
+FAILS=$(grep -c "^FAIL" "$TMP_RESULT")
+PASSES=$(grep -c "^PASS" "$TMP_RESULT")
+
+echo -e "\nSUMMARY:"
+echo "Total WorkSpaces checked: $TOTAL"
+echo "PASS (encrypted):         $PASSES"
+echo "FAIL (unencrypted):       $FAILS"
+
+rm -f "$TMP_RESULT"
