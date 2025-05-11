@@ -1,0 +1,130 @@
+#!/bin/bash
+
+TMP_RESULT="/tmp/iam_role_policy_audit.txt"
+> "$TMP_RESULT"
+
+MAX_PARALLEL=10
+
+echo "🔍 Auditing IAM Roles for overly permissive managed and inline policies..."
+
+check_policy_json() {
+  local JSON="$1"
+  local CONTEXT="$2"
+
+  python3 - "$CONTEXT" "$TMP_RESULT" <<EOF
+import json, sys
+
+context = sys.argv[1]
+outfile = sys.argv[2]
+doc = json.loads('''$JSON''')
+
+def is_wild(val):
+    if isinstance(val, str):
+        return val == "*" or val.endswith("*")
+    if isinstance(val, list):
+        return any(v == "*" or v.endswith("*") for v in val)
+    return False
+
+risk_found = False
+statements = doc.get("Statement", [])
+if not isinstance(statements, list): statements = [statements]
+
+for stmt in statements:
+    effect = stmt.get("Effect")
+    if effect != "Allow":
+        continue
+
+    action = stmt.get("Action", [])
+    resource = stmt.get("Resource", [])
+    not_action = stmt.get("NotAction")
+
+    if isinstance(action, str): action = [action]
+    if isinstance(resource, str): resource = [resource]
+
+    if "*" in action and "*" in resource:
+        msg = f"FAIL\t{context}\tFull '*:*' access"
+        risk_found = True
+        break
+    if any(a.startswith("iam:") for a in action) and "*" in resource:
+        msg = f"FAIL\t{context}\tAllows 'iam:*' on *"
+        risk_found = True
+        break
+    if "iam:PassRole" in action and is_wild(resource):
+        msg = f"FAIL\t{context}\tAllows 'iam:PassRole' on wildcard resource"
+        risk_found = True
+        break
+    if not_action:
+        msg = f"WARNING\t{context}\tContains NotAction with Allow"
+        risk_found = True
+        break
+
+if not risk_found:
+    msg = f"PASS\t{context}\tNo risky permissions detected"
+
+with open(outfile, "a") as f:
+    f.write(msg + "\\n")
+EOF
+}
+
+audit_role() {
+  local ROLE_NAME="$1"
+
+  echo "🔎 Auditing role: $ROLE_NAME"
+
+  # Attached managed policies
+  ATTACHED=$(aws iam list-attached-role-policies --role-name "$ROLE_NAME" --query "AttachedPolicies[*].PolicyArn" --output text)
+  for POLICY_ARN in $ATTACHED; do
+    VERSION_ID=$(aws iam get-policy --policy-arn "$POLICY_ARN" --query "Policy.DefaultVersionId" --output text 2>/dev/null)
+    POLICY_DOC=$(aws iam get-policy-version \
+      --policy-arn "$POLICY_ARN" \
+      --version-id "$VERSION_ID" \
+      --query "PolicyVersion.Document" \
+      --output json 2>/dev/null)
+    check_policy_json "$POLICY_DOC" "$ROLE_NAME (managed: $POLICY_ARN)"
+  done
+
+  # Inline policies
+  INLINE_NAMES=$(aws iam list-role-policies --role-name "$ROLE_NAME" --query "PolicyNames" --output text)
+  for POLICY_NAME in $INLINE_NAMES; do
+    INLINE_DOC=$(aws iam get-role-policy \
+      --role-name "$ROLE_NAME" \
+      --policy-name "$POLICY_NAME" \
+      --query "PolicyDocument" \
+      --output json 2>/dev/null)
+    check_policy_json "$INLINE_DOC" "$ROLE_NAME (inline: $POLICY_NAME)"
+  done
+}
+
+# List all IAM roles
+ROLE_NAMES=$(aws iam list-roles --query "Roles[*].RoleName" --output text)
+
+JOB_COUNT=0
+for ROLE in $ROLE_NAMES; do
+  audit_role "$ROLE" &
+
+  ((JOB_COUNT++))
+  if (( JOB_COUNT >= MAX_PARALLEL )); then
+    wait
+    JOB_COUNT=0
+  fi
+done
+
+wait
+
+# Report
+echo -e "\n===== IAM ROLE POLICY RISK AUDIT ====="
+printf "STATUS\tCONTEXT\tDETAIL\n"
+sort "$TMP_RESULT"
+
+TOTAL=$(wc -l < "$TMP_RESULT")
+FAILS=$(grep -c "^FAIL" "$TMP_RESULT")
+WARNS=$(grep -c "^WARNING" "$TMP_RESULT")
+PASSES=$(grep -c "^PASS" "$TMP_RESULT")
+
+echo -e "\nSUMMARY:"
+echo "Total policies evaluated:  $TOTAL"
+echo "FAIL (risky):              $FAILS"
+echo "WARNING (needs review):    $WARNS"
+echo "PASS (compliant):          $PASSES"
+
+rm -f "$TMP_RESULT"
