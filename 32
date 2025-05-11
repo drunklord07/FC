@@ -1,0 +1,60 @@
+#!/bin/bash
+
+REGION="ap-south-1"
+MAX_PARALLEL=10
+TMP_RESULT="/tmp/sns_encryption_audit.txt"
+> "$TMP_RESULT"
+
+echo "🔍 Auditing SNS topics in region: $REGION for encryption at rest (parallel mode)..."
+
+check_topic() {
+  local TOPIC_ARN="$1"
+
+  KMS_KEY=$(aws sns get-topic-attributes \
+    --region "$REGION" \
+    --topic-arn "$TOPIC_ARN" \
+    --query "Attributes.KmsMasterKeyId" \
+    --output text 2>/dev/null)
+
+  if [[ -z "$KMS_KEY" || "$KMS_KEY" == "None" ]]; then
+    echo -e "FAIL\t$TOPIC_ARN\tUnencrypted (no KMS key set)" >> "$TMP_RESULT"
+  else
+    echo -e "PASS\t$TOPIC_ARN\tEncrypted with KMS Key: $KMS_KEY" >> "$TMP_RESULT"
+  fi
+}
+
+# List all SNS topic ARNs
+TOPICS=$(aws sns list-topics \
+  --region "$REGION" \
+  --query "Topics[*].TopicArn" \
+  --output text)
+
+# Run checks in parallel
+JOB_COUNT=0
+for TOPIC_ARN in $TOPICS; do
+  check_topic "$TOPIC_ARN" &
+
+  ((JOB_COUNT++))
+  if (( JOB_COUNT >= MAX_PARALLEL )); then
+    wait
+    JOB_COUNT=0
+  fi
+done
+
+wait
+
+# Output report
+echo -e "\n===== SNS TOPIC ENCRYPTION AUDIT ====="
+printf "STATUS\tTOPIC_ARN\tDETAIL\n"
+sort "$TMP_RESULT"
+
+TOTAL=$(wc -l < "$TMP_RESULT")
+FAILS=$(grep -c "^FAIL" "$TMP_RESULT")
+PASSES=$(grep -c "^PASS" "$TMP_RESULT")
+
+echo -e "\nSUMMARY:"
+echo "Total topics checked: $TOTAL"
+echo "PASS (encrypted):     $PASSES"
+echo "FAIL (unencrypted):   $FAILS"
+
+rm -f "$TMP_RESULT"
