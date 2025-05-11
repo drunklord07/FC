@@ -1,0 +1,62 @@
+#!/bin/bash
+
+REGION="ap-south-1"
+TMP_RESULT="/tmp/apigateway_authorizer_audit.txt"
+> "$TMP_RESULT"
+
+echo "🔍 Auditing API Gateway methods for authorizer configuration in region: $REGION..."
+
+# Get all REST APIs
+APIS=$(aws apigateway get-rest-apis \
+  --region "$REGION" \
+  --query 'items[*].[id,name]' \
+  --output text)
+
+while read -r API_ID API_NAME; do
+  RESOURCE_IDS=$(aws apigateway get-resources \
+    --region "$REGION" \
+    --rest-api-id "$API_ID" \
+    --query 'items[*].[id,path]' \
+    --output text)
+
+  while read -r RESOURCE_ID RESOURCE_PATH; do
+    METHODS=$(aws apigateway get-resource \
+      --region "$REGION" \
+      --rest-api-id "$API_ID" \
+      --resource-id "$RESOURCE_ID" \
+      --query 'resourceMethods' \
+      --output json)
+
+    for METHOD in $(echo "$METHODS" | jq -r 'keys[]' 2>/dev/null); do
+      AUTH_TYPE=$(aws apigateway get-method \
+        --region "$REGION" \
+        --rest-api-id "$API_ID" \
+        --resource-id "$RESOURCE_ID" \
+        --http-method "$METHOD" \
+        --query 'authorizationType' \
+        --output text 2>/dev/null)
+
+      if [[ "$AUTH_TYPE" == "NONE" ]]; then
+        echo -e "FAIL\t$API_NAME\t$METHOD $RESOURCE_PATH\tNo authorizer configured" >> "$TMP_RESULT"
+      else
+        echo -e "PASS\t$API_NAME\t$METHOD $RESOURCE_PATH\tAuth: $AUTH_TYPE" >> "$TMP_RESULT"
+      fi
+    done
+  done <<< "$RESOURCE_IDS"
+done <<< "$APIS"
+
+# Output report
+echo -e "\n===== API GATEWAY AUTHORIZER AUDIT ====="
+printf "STATUS\tAPI\tMETHOD\tDETAIL\n"
+sort "$TMP_RESULT"
+
+TOTAL=$(wc -l < "$TMP_RESULT")
+FAILS=$(grep -c "^FAIL" "$TMP_RESULT")
+PASSES=$(grep -c "^PASS" "$TMP_RESULT")
+
+echo -e "\nSUMMARY:"
+echo "Total method checks:        $TOTAL"
+echo "PASS (auth configured):     $PASSES"
+echo "FAIL (no auth configured):  $FAILS"
+
+rm -f "$TMP_RESULT"
