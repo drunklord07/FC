@@ -1,0 +1,55 @@
+#!/bin/bash
+
+REGION="ap-south-1"
+TMP_RESULT="/tmp/apigateway_waf_audit.txt"
+> "$TMP_RESULT"
+
+echo "🔍 Auditing API Gateway stages for WAF ACL attachment in region: $REGION..."
+
+# Get all REST APIs
+APIS=$(aws apigateway get-rest-apis \
+  --region "$REGION" \
+  --query 'items[*].[id,name]' \
+  --output text)
+
+# Get all WAF-associated resource ARNs (regional)
+WAF_ASSOCIATED=$(aws wafv2 list-resources-for-web-acl \
+  --region "$REGION" \
+  --scope REGIONAL \
+  --resource-type API_GATEWAY \
+  --query 'ResourceArns' \
+  --output text)
+
+while read -r API_ID API_NAME; do
+  STAGES=$(aws apigateway get-stages \
+    --region "$REGION" \
+    --rest-api-id "$API_ID" \
+    --query 'item[*].stageName' \
+    --output text)
+
+  for STAGE in $STAGES; do
+    STAGE_ARN="arn:aws:apigateway:$REGION::/restapis/$API_ID/stages/$STAGE"
+
+    if echo "$WAF_ASSOCIATED" | grep -q "$STAGE_ARN"; then
+      echo -e "PASS\t$API_NAME ($STAGE)\tWAF attached" >> "$TMP_RESULT"
+    else
+      echo -e "FAIL\t$API_NAME ($STAGE)\tNo WAF ACL attached" >> "$TMP_RESULT"
+    fi
+  done
+done <<< "$APIS"
+
+# Output results
+echo -e "\n===== API GATEWAY WAF ATTACHMENT AUDIT ====="
+printf "STATUS\tSTAGE\tDETAIL\n"
+sort "$TMP_RESULT"
+
+TOTAL=$(wc -l < "$TMP_RESULT")
+FAILS=$(grep -c "^FAIL" "$TMP_RESULT")
+PASSES=$(grep -c "^PASS" "$TMP_RESULT")
+
+echo -e "\nSUMMARY:"
+echo "Total stages checked:       $TOTAL"
+echo "PASS (WAF attached):        $PASSES"
+echo "FAIL (no WAF attached):     $FAILS"
+
+rm -f "$TMP_RESULT"
