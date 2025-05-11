@@ -1,0 +1,59 @@
+#!/bin/bash
+
+REGION="ap-south-1"
+TMP_RESULT="/tmp/sagemaker_notebook_root_access.txt"
+> "$TMP_RESULT"
+
+echo "🔍 Auditing SageMaker notebook instances for root access settings in region: $REGION..."
+
+# Get all notebook instance names
+NOTEBOOKS=$(aws sagemaker list-notebook-instances \
+  --region "$REGION" \
+  --query 'NotebookInstances[*].NotebookInstanceName' \
+  --output text)
+
+check_root_access() {
+  local NAME="$1"
+
+  ROOT=$(aws sagemaker describe-notebook-instance \
+    --region "$REGION" \
+    --notebook-instance-name "$NAME" \
+    --query 'RootAccess' \
+    --output text 2>/dev/null)
+
+  if [[ "$ROOT" == "Disabled" ]]; then
+    echo -e "PASS\t$NAME\tRoot access is DISABLED" >> "$TMP_RESULT"
+  else
+    echo -e "FAIL\t$NAME\tRoot access is ENABLED" >> "$TMP_RESULT"
+  fi
+}
+
+MAX_PARALLEL=5
+JOB_COUNT=0
+for NAME in $NOTEBOOKS; do
+  check_root_access "$NAME" &
+
+  ((JOB_COUNT++))
+  if (( JOB_COUNT >= MAX_PARALLEL )); then
+    wait
+    JOB_COUNT=0
+  fi
+done
+
+wait
+
+# Output results
+echo -e "\n===== SAGEMAKER NOTEBOOK ROOT ACCESS AUDIT ====="
+printf "STATUS\tNOTEBOOK\tDETAIL\n"
+sort "$TMP_RESULT"
+
+TOTAL=$(wc -l < "$TMP_RESULT")
+FAILS=$(grep -c "^FAIL" "$TMP_RESULT")
+PASSES=$(grep -c "^PASS" "$TMP_RESULT")
+
+echo -e "\nSUMMARY:"
+echo "Total notebooks checked:  $TOTAL"
+echo "PASS (no root access):    $PASSES"
+echo "FAIL (root enabled):      $FAILS"
+
+rm -f "$TMP_RESULT"
