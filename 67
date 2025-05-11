@@ -1,0 +1,52 @@
+#!/bin/bash
+
+REGION="ap-south-1"
+TMP_RESULT="/tmp/wafv2_logging_full_audit.txt"
+> "$TMP_RESULT"
+
+echo "🔍 Auditing WAFv2 WebACLs for logging (REGIONAL + CLOUDFRONT scopes)..."
+
+check_scope() {
+  local SCOPE=$1
+
+  echo -e "\n📘 Scope: $SCOPE" >> "$TMP_RESULT"
+
+  WEBACLS=$(aws wafv2 list-web-acls \
+    --region "$REGION" \
+    --scope "$SCOPE" \
+    --query 'WebACLs[*].[Name,ARN]' \
+    --output text 2>/dev/null)
+
+  while read -r NAME ARN; do
+    LOGGING=$(aws wafv2 get-logging-configuration \
+      --region "$REGION" \
+      --resource-arn "$ARN" 2>&1)
+
+    if echo "$LOGGING" | grep -q "LoggingConfiguration"; then
+      DEST=$(echo "$LOGGING" | grep -o '"LogDestinationConfigs": \[[^]]*' | cut -d'"' -f4)
+      echo -e "PASS\t$SCOPE\t$NAME\tLogging → $DEST" >> "$TMP_RESULT"
+    else
+      echo -e "FAIL\t$SCOPE\t$NAME\tNo logging configured" >> "$TMP_RESULT"
+    fi
+  done <<< "$WEBACLS"
+}
+
+# Run for both scopes
+check_scope REGIONAL
+check_scope CLOUDFRONT
+
+# Output report
+echo -e "\n===== AWS WAFv2 LOGGING AUDIT ====="
+printf "STATUS\tSCOPE\tWEBACL\tDETAIL\n"
+sort "$TMP_RESULT"
+
+TOTAL=$(grep -c '^[A-Z]' "$TMP_RESULT")
+FAILS=$(grep -c "^FAIL" "$TMP_RESULT")
+PASSES=$(grep -c "^PASS" "$TMP_RESULT")
+
+echo -e "\nSUMMARY:"
+echo "Total WebACLs checked:     $TOTAL"
+echo "PASS (logging enabled):    $PASSES"
+echo "FAIL (logging missing):    $FAILS"
+
+rm -f "$TMP_RESULT"
