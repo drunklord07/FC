@@ -1,0 +1,60 @@
+#!/bin/bash
+
+REGION="ap-south-1"
+MAX_PARALLEL=10
+TMP_RESULT="/tmp/vpc_endpoint_subnet_audit.txt"
+> "$TMP_RESULT"
+
+echo "🔍 Auditing VPC Interface Endpoints in region: $REGION for multiple subnet attachments..."
+
+# Get all interface VPC endpoints
+ENDPOINT_IDS=$(aws ec2 describe-vpc-endpoints \
+  --region "$REGION" \
+  --query 'VpcEndpoints[?VpcEndpointType==`Interface`].VpcEndpointId' \
+  --output text)
+
+check_endpoint() {
+  local ENDPOINT_ID="$1"
+
+  SUBNET_COUNT=$(aws ec2 describe-vpc-endpoints \
+    --region "$REGION" \
+    --vpc-endpoint-ids "$ENDPOINT_ID" \
+    --query "VpcEndpoints[0].SubnetIds | length(@)" \
+    --output text 2>/dev/null)
+
+  if [[ "$SUBNET_COUNT" -gt 1 ]]; then
+    echo -e "PASS\t$ENDPOINT_ID\tAttached to $SUBNET_COUNT subnets" >> "$TMP_RESULT"
+  else
+    echo -e "FAIL\t$ENDPOINT_ID\tOnly $SUBNET_COUNT subnet attached" >> "$TMP_RESULT"
+  fi
+}
+
+# Run in parallel
+JOB_COUNT=0
+for ENDPOINT_ID in $ENDPOINT_IDS; do
+  check_endpoint "$ENDPOINT_ID" &
+
+  ((JOB_COUNT++))
+  if (( JOB_COUNT >= MAX_PARALLEL )); then
+    wait
+    JOB_COUNT=0
+  fi
+done
+
+wait
+
+# Output
+echo -e "\n===== VPC INTERFACE ENDPOINT SUBNET AUDIT ====="
+printf "STATUS\tENDPOINT_ID\tDETAIL\n"
+sort "$TMP_RESULT"
+
+TOTAL=$(wc -l < "$TMP_RESULT")
+FAILS=$(grep -c "^FAIL" "$TMP_RESULT")
+PASSES=$(grep -c "^PASS" "$TMP_RESULT")
+
+echo -e "\nSUMMARY:"
+echo "Total interface endpoints checked: $TOTAL"
+echo "PASS (multi-subnet):               $PASSES"
+echo "FAIL (single subnet):              $FAILS"
+
+rm -f "$TMP_RESULT"
