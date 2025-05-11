@@ -1,0 +1,62 @@
+#!/bin/bash
+
+REGION="ap-south-1"
+TMP_RESULT="/tmp/sagemaker_model_vpc_audit.txt"
+> "$TMP_RESULT"
+
+echo "🔍 Auditing SageMaker models for VPC configuration in region: $REGION..."
+
+# Get list of all SageMaker models
+MODEL_NAMES=$(aws sagemaker list-models \
+  --region "$REGION" \
+  --query 'Models[*].ModelName' \
+  --output text)
+
+check_model() {
+  local MODEL="$1"
+
+  VPC_JSON=$(aws sagemaker describe-model \
+    --region "$REGION" \
+    --model-name "$MODEL" \
+    --query 'VpcConfig' \
+    --output json 2>/dev/null)
+
+  SUBNET_COUNT=$(echo "$VPC_JSON" | grep -o '"Subnets": \[[^]]*\]' | grep -o 'subnet-' | wc -l)
+  SG_COUNT=$(echo "$VPC_JSON" | grep -o '"SecurityGroupIds": \[[^]]*\]' | grep -o 'sg-' | wc -l)
+
+  if [[ "$SUBNET_COUNT" -gt 0 && "$SG_COUNT" -gt 0 ]]; then
+    echo -e "PASS\t$MODEL\tVPC configured: $SUBNET_COUNT subnet(s), $SG_COUNT SG(s)" >> "$TMP_RESULT"
+  else
+    echo -e "FAIL\t$MODEL\tMissing or incomplete VPC configuration" >> "$TMP_RESULT"
+  fi
+}
+
+MAX_PARALLEL=5
+JOB_COUNT=0
+for MODEL in $MODEL_NAMES; do
+  check_model "$MODEL" &
+
+  ((JOB_COUNT++))
+  if (( JOB_COUNT >= MAX_PARALLEL )); then
+    wait
+    JOB_COUNT=0
+  fi
+done
+
+wait
+
+# Output results
+echo -e "\n===== SAGEMAKER MODEL VPC CONFIG AUDIT ====="
+printf "STATUS\tMODEL\tDETAIL\n"
+sort "$TMP_RESULT"
+
+TOTAL=$(wc -l < "$TMP_RESULT")
+FAILS=$(grep -c "^FAIL" "$TMP_RESULT")
+PASSES=$(grep -c "^PASS" "$TMP_RESULT")
+
+echo -e "\nSUMMARY:"
+echo "Total models checked:  $TOTAL"
+echo "PASS (has VPC config): $PASSES"
+echo "FAIL (no VPC config):  $FAILS"
+
+rm -f "$TMP_RESULT"
