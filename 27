@@ -1,22 +1,24 @@
 #!/bin/bash
 
+set -euo pipefail
+
 TMP_RESULT="/tmp/iam_role_policy_audit.txt"
 > "$TMP_RESULT"
 
-MAX_PARALLEL=10
+MAX_PARALLEL=20
 
 echo "🔍 Auditing IAM Roles for overly permissive managed and inline policies..."
 
-check_policy_json() {
-  local JSON="$1"
-  local CONTEXT="$2"
-
-  python3 - "$CONTEXT" "$TMP_RESULT" <<EOF
-import json, sys
+# External Python script
+PYTHON_CHECKER=$(mktemp /tmp/role_policy_checker.XXXX.py)
+cat > "$PYTHON_CHECKER" <<'EOF'
+import sys, json, base64
 
 context = sys.argv[1]
 outfile = sys.argv[2]
-doc = json.loads('''$JSON''')
+b64doc = sys.argv[3]
+
+policy = json.loads(base64.b64decode(b64doc).decode())
 
 def is_wild(val):
     if isinstance(val, str):
@@ -26,12 +28,12 @@ def is_wild(val):
     return False
 
 risk_found = False
-statements = doc.get("Statement", [])
-if not isinstance(statements, list): statements = [statements]
+statements = policy.get("Statement", [])
+if not isinstance(statements, list):
+    statements = [statements]
 
 for stmt in statements:
-    effect = stmt.get("Effect")
-    if effect != "Allow":
+    if stmt.get("Effect") != "Allow":
         continue
 
     action = stmt.get("Action", [])
@@ -62,64 +64,86 @@ if not risk_found:
     msg = f"PASS\t{context}\tNo risky permissions detected"
 
 with open(outfile, "a") as f:
-    f.write(msg + "\\n")
+    f.write(msg + "\n")
 EOF
+
+# Function to evaluate a single policy document
+check_policy_json() {
+  local JSON="$1"
+  local CONTEXT="$2"
+  local B64_JSON
+  B64_JSON=$(echo "$JSON" | base64 | tr -d '\n')
+
+  python3 "$PYTHON_CHECKER" "$CONTEXT" "$TMP_RESULT" "$B64_JSON"
 }
 
+# Audit one role
 audit_role() {
   local ROLE_NAME="$1"
 
-  echo "🔎 Auditing role: $ROLE_NAME"
-
   # Attached managed policies
-  ATTACHED=$(aws iam list-attached-role-policies --role-name "$ROLE_NAME" --query "AttachedPolicies[*].PolicyArn" --output text)
-  for POLICY_ARN in $ATTACHED; do
-    VERSION_ID=$(aws iam get-policy --policy-arn "$POLICY_ARN" --query "Policy.DefaultVersionId" --output text 2>/dev/null)
-    POLICY_DOC=$(aws iam get-policy-version \
-      --policy-arn "$POLICY_ARN" \
-      --version-id "$VERSION_ID" \
-      --query "PolicyVersion.Document" \
-      --output json 2>/dev/null)
-    check_policy_json "$POLICY_DOC" "$ROLE_NAME (managed: $POLICY_ARN)"
+  aws iam list-attached-role-policies --role-name "$ROLE_NAME" \
+    --query "AttachedPolicies[*].PolicyArn" --output text | tr '\t' '\n' | while read -r POLICY_ARN; do
+    {
+      VERSION_ID=$(aws iam get-policy --policy-arn "$POLICY_ARN" --query "Policy.DefaultVersionId" --output text 2>/dev/null) || return
+      POLICY_DOC=$(aws iam get-policy-version --policy-arn "$POLICY_ARN" --version-id "$VERSION_ID" --query "PolicyVersion.Document" --output json 2>/dev/null) || return
+      check_policy_json "$POLICY_DOC" "$ROLE_NAME (managed: $POLICY_ARN)"
+    } &
   done
 
   # Inline policies
-  INLINE_NAMES=$(aws iam list-role-policies --role-name "$ROLE_NAME" --query "PolicyNames" --output text)
-  for POLICY_NAME in $INLINE_NAMES; do
-    INLINE_DOC=$(aws iam get-role-policy \
-      --role-name "$ROLE_NAME" \
-      --policy-name "$POLICY_NAME" \
-      --query "PolicyDocument" \
-      --output json 2>/dev/null)
-    check_policy_json "$INLINE_DOC" "$ROLE_NAME (inline: $POLICY_NAME)"
+  aws iam list-role-policies --role-name "$ROLE_NAME" --query "PolicyNames" --output text | tr '\t' '\n' | while read -r POLICY_NAME; do
+    {
+      INLINE_DOC=$(aws iam get-role-policy --role-name "$ROLE_NAME" --policy-name "$POLICY_NAME" --query "PolicyDocument" --output json 2>/dev/null) || return
+      check_policy_json "$INLINE_DOC" "$ROLE_NAME (inline: $POLICY_NAME)"
+    } &
   done
 }
 
-# List all IAM roles
-ROLE_NAMES=$(aws iam list-roles --query "Roles[*].RoleName" --output text)
+# Progress setup
+ROLE_NAMES=($(aws iam list-roles --query "Roles[*].RoleName" --output text))
+TOTAL=${#ROLE_NAMES[@]}
+COUNT=0
 
-JOB_COUNT=0
-for ROLE in $ROLE_NAMES; do
+show_progress() {
+  local done=$1
+  local total=$2
+  local percent=$((done * 100 / total))
+  printf "\rProgress: %3d%% [%d/%d]" "$percent" "$done" "$total"
+}
+
+# Run audit in parallel for each role
+PIDS=()
+for ROLE in "${ROLE_NAMES[@]}"; do
   audit_role "$ROLE" &
+  PIDS+=($!)
+  ((COUNT++))
+  show_progress "$COUNT" "$TOTAL"
 
-  ((JOB_COUNT++))
-  if (( JOB_COUNT >= MAX_PARALLEL )); then
-    wait
-    JOB_COUNT=0
+  if (( ${#PIDS[@]} >= MAX_PARALLEL )); then
+    wait -n
+    # Remove finished PIDs
+    for i in "${!PIDS[@]}"; do
+      if ! kill -0 "${PIDS[i]}" 2>/dev/null; then
+        unset 'PIDS[i]'
+      fi
+    done
   fi
 done
 
 wait
+show_progress "$TOTAL" "$TOTAL"
+echo -e "\n✅ Audit complete.\n"
 
 # Report
-echo -e "\n===== IAM ROLE POLICY RISK AUDIT ====="
+echo -e "===== IAM ROLE POLICY RISK AUDIT ====="
 printf "STATUS\tCONTEXT\tDETAIL\n"
 sort "$TMP_RESULT"
 
 TOTAL=$(wc -l < "$TMP_RESULT")
-FAILS=$(grep -c "^FAIL" "$TMP_RESULT")
-WARNS=$(grep -c "^WARNING" "$TMP_RESULT")
-PASSES=$(grep -c "^PASS" "$TMP_RESULT")
+FAILS=$(grep -c "^FAIL" "$TMP_RESULT" || true)
+WARNS=$(grep -c "^WARNING" "$TMP_RESULT" || true)
+PASSES=$(grep -c "^PASS" "$TMP_RESULT" || true)
 
 echo -e "\nSUMMARY:"
 echo "Total policies evaluated:  $TOTAL"
@@ -127,4 +151,4 @@ echo "FAIL (risky):              $FAILS"
 echo "WARNING (needs review):    $WARNS"
 echo "PASS (compliant):          $PASSES"
 
-rm -f "$TMP_RESULT"
+rm -f "$TMP_RESULT" "$PYTHON_CHECKER"
