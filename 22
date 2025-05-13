@@ -1,18 +1,20 @@
 #!/bin/bash
 
-set -e
+set -euo pipefail
 
 TMP_RESULT="/tmp/iam_full_access_audit.txt"
 > "$TMP_RESULT"
 
-MAX_PARALLEL=10
+MAX_PARALLEL=20
 
 echo "🔍 Auditing customer-managed IAM policies for full '*:*' access..."
 
+# Create temp Python checker script
 PYTHON_CHECKER=$(mktemp /tmp/iam_policy_check.XXXX.py)
 
 cat > "$PYTHON_CHECKER" <<'EOF'
 import sys, json
+from subprocess import check_output, CalledProcessError
 
 arn = sys.argv[1]
 outfile = sys.argv[2]
@@ -20,51 +22,56 @@ policy = sys.stdin.read()
 
 try:
     doc = json.loads(policy)
-    statements = doc.get("Statement", [])
-    if isinstance(statements, dict):
-        statements = [statements]
+except json.JSONDecodeError as e:
+    with open(outfile, 'a') as f:
+        f.write(f"FAIL\t{arn}\tInvalid JSON: {e}\n")
+    sys.exit(0)
 
-    found_full_access = False
-    for stmt in statements:
-        if stmt.get("Effect") != "Allow":
-            continue
+statements = doc.get("Statement", [])
+if isinstance(statements, dict):
+    statements = [statements]
 
-        actions = stmt.get("Action", [])
-        resources = stmt.get("Resource", [])
+found_full_access = False
+for stmt in statements:
+    if stmt.get("Effect") != "Allow":
+        continue
 
-        if isinstance(actions, str):
-            actions = [actions]
-        if isinstance(resources, str):
-            resources = [resources]
+    actions = stmt.get("Action")
+    resources = stmt.get("Resource")
 
-        if "*" in actions and "*" in resources:
-            found_full_access = True
-            break
+    # Normalize to list
+    if isinstance(actions, str): actions = [actions]
+    if actions is None: actions = []
 
-    if found_full_access:
-        from subprocess import check_output
+    if isinstance(resources, str): resources = [resources]
+    if resources is None: resources = []
+
+    if "*" in actions and "*" in resources:
+        found_full_access = True
+        break
+
+if found_full_access:
+    try:
         attached = check_output([
             "aws", "iam", "list-entities-for-policy",
             "--policy-arn", arn,
             "--query", "concat(PolicyUsers, PolicyGroups, PolicyRoles)[*].Type",
             "--output", "text"
         ]).decode().strip()
+    except CalledProcessError:
+        attached = ""
 
-        with open(outfile, "a") as f:
-            if attached:
-                f.write(f"FAIL\t{arn}\tFull '*:*' and attached\n")
-            else:
-                f.write(f"WARNING\t{arn}\tFull '*:*' but NOT attached\n")
-    else:
-        with open(outfile, "a") as f:
-            f.write(f"PASS\t{arn}\tNo full '*:*' access\n")
-
-except Exception as e:
     with open(outfile, "a") as f:
-        f.write(f"FAIL\t{arn}\tInvalid JSON or error: {str(e)}\n")
+        if attached:
+            f.write(f"FAIL\t{arn}\tFull '*:*' and attached\n")
+        else:
+            f.write(f"WARNING\t{arn}\tFull '*:*' but NOT attached\n")
+else:
+    with open(outfile, "a") as f:
+        f.write(f"PASS\t{arn}\tNo full '*:*' access\n")
 EOF
 
-# Get all customer-managed policy ARNs
+# List customer-managed policy ARNs
 mapfile -t POLICY_ARNS < <(aws iam list-policies \
   --scope Local \
   --query 'Policies[*].Arn' \
@@ -73,7 +80,6 @@ mapfile -t POLICY_ARNS < <(aws iam list-policies \
 TOTAL=${#POLICY_ARNS[@]}
 COUNT=0
 
-# Show simple progress
 show_progress() {
     local done=$1
     local total=$2
@@ -81,11 +87,12 @@ show_progress() {
     printf "\rProgress: %3d%% [%d/%d]" "$percent" "$done" "$total"
 }
 
-# Check a single policy in background
+# Policy check function
 check_policy() {
     local POLICY_ARN="$1"
 
-    VERSION_ID=$(aws iam get-policy --policy-arn "$POLICY_ARN" \
+    VERSION_ID=$(aws iam get-policy \
+        --policy-arn "$POLICY_ARN" \
         --query "Policy.DefaultVersionId" \
         --output text 2>/dev/null) || return
 
@@ -98,7 +105,7 @@ check_policy() {
     echo "$POLICY_DOC" | python3 "$PYTHON_CHECKER" "$POLICY_ARN" "$TMP_RESULT"
 }
 
-# Main parallel loop
+# Run in parallel with limit
 PIDS=()
 for POLICY_ARN in "${POLICY_ARNS[@]}"; do
     check_policy "$POLICY_ARN" &
@@ -108,7 +115,6 @@ for POLICY_ARN in "${POLICY_ARNS[@]}"; do
 
     if (( ${#PIDS[@]} >= MAX_PARALLEL )); then
         wait -n
-        # clean finished PIDs
         for i in "${!PIDS[@]}"; do
             if ! kill -0 "${PIDS[i]}" 2>/dev/null; then
                 unset 'PIDS[i]'
@@ -121,15 +127,15 @@ wait
 show_progress "$TOTAL" "$TOTAL"
 echo -e "\n✅ Audit complete.\n"
 
-# Report
+# Final report
 echo -e "===== IAM POLICY AUDIT REPORT ====="
 printf "STATUS\tPOLICY_ARN\tDETAIL\n"
 sort "$TMP_RESULT"
 
 TOTAL=$(wc -l < "$TMP_RESULT")
-FAILS=$(grep -c "^FAIL" "$TMP_RESULT")
-WARNS=$(grep -c "^WARNING" "$TMP_RESULT")
-PASSES=$(grep -c "^PASS" "$TMP_RESULT")
+FAILS=$(grep -c "^FAIL" "$TMP_RESULT" || true)
+WARNS=$(grep -c "^WARNING" "$TMP_RESULT" || true)
+PASSES=$(grep -c "^PASS" "$TMP_RESULT" || true)
 
 echo -e "\nSUMMARY:"
 echo "Total policies checked:   $TOTAL"
@@ -137,4 +143,4 @@ echo "FAIL (attached *:*):      $FAILS"
 echo "WARNING (unattached *:*): $WARNS"
 echo "PASS (compliant):         $PASSES"
 
-rm -f "$TMP_RESULT" "$PYTHON_CHECKER"
+rm -f "$PYTHON_CHECKER"
