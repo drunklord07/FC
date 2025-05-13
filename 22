@@ -1,73 +1,79 @@
 #!/bin/bash
 
+set -e
+
 TMP_RESULT="/tmp/iam_full_access_audit.txt"
 > "$TMP_RESULT"
 
 MAX_PARALLEL=10
-REGION="ap-south-1"
 
-echo "🔍 Auditing IAM customer-managed policies for unrestricted '*:*' permissions..."
+echo "🔍 Auditing customer-managed IAM policies for full '*:*' access..."
 
-# External Python file (created once and reused)
-PYTHON_CHECKER=$(mktemp /tmp/policy_check.XXXX.py)
+PYTHON_CHECKER=$(mktemp /tmp/iam_policy_check.XXXX.py)
 
 cat > "$PYTHON_CHECKER" <<'EOF'
 import sys, json
-from subprocess import check_output, CalledProcessError
 
 arn = sys.argv[1]
 outfile = sys.argv[2]
-doc = sys.stdin.read()
+policy = sys.stdin.read()
 
 try:
-    policy = json.loads(doc)
-except:
-    with open(outfile, 'a') as f:
-        f.write(f"FAIL\t{arn}\tInvalid JSON\n")
-    sys.exit(0)
+    doc = json.loads(policy)
+    statements = doc.get("Statement", [])
+    if isinstance(statements, dict):
+        statements = [statements]
 
-statements = policy.get("Statement", [])
-if not isinstance(statements, list):
-    statements = [statements]
+    found_full_access = False
+    for stmt in statements:
+        if stmt.get("Effect") != "Allow":
+            continue
 
-for stmt in statements:
-    if stmt.get("Effect") != "Allow":
-        continue
+        actions = stmt.get("Action", [])
+        resources = stmt.get("Resource", [])
 
-    actions = stmt.get("Action", [])
-    resources = stmt.get("Resource", [])
+        if isinstance(actions, str):
+            actions = [actions]
+        if isinstance(resources, str):
+            resources = [resources]
 
-    if isinstance(actions, str): actions = [actions]
-    if isinstance(resources, str): resources = [resources]
+        if "*" in actions and "*" in resources:
+            found_full_access = True
+            break
 
-    if "*" in actions and "*" in resources:
-        try:
-            attached = check_output([
-                "aws", "iam", "list-entities-for-policy",
-                "--policy-arn", arn,
-                "--query", "PolicyUsers || PolicyGroups || PolicyRoles",
-                "--output", "text"
-            ]).decode().strip()
-        except CalledProcessError:
-            attached = ""
+    if found_full_access:
+        from subprocess import check_output
+        attached = check_output([
+            "aws", "iam", "list-entities-for-policy",
+            "--policy-arn", arn,
+            "--query", "concat(PolicyUsers, PolicyGroups, PolicyRoles)[*].Type",
+            "--output", "text"
+        ]).decode().strip()
 
         with open(outfile, "a") as f:
             if attached:
                 f.write(f"FAIL\t{arn}\tFull '*:*' and attached\n")
             else:
                 f.write(f"WARNING\t{arn}\tFull '*:*' but NOT attached\n")
-        break
-else:
+    else:
+        with open(outfile, "a") as f:
+            f.write(f"PASS\t{arn}\tNo full '*:*' access\n")
+
+except Exception as e:
     with open(outfile, "a") as f:
-        f.write(f"PASS\t{arn}\tNo full '*:*' access\n")
+        f.write(f"FAIL\t{arn}\tInvalid JSON or error: {str(e)}\n")
 EOF
 
-# Get policy list
-POLICY_ARNS=($(aws iam list-policies --scope Local --query "Policies[*].Arn" --output text))
+# Get all customer-managed policy ARNs
+mapfile -t POLICY_ARNS < <(aws iam list-policies \
+  --scope Local \
+  --query 'Policies[*].Arn' \
+  --output text)
+
 TOTAL=${#POLICY_ARNS[@]}
 COUNT=0
 
-# Simple progress display
+# Show simple progress
 show_progress() {
     local done=$1
     local total=$2
@@ -75,28 +81,34 @@ show_progress() {
     printf "\rProgress: %3d%% [%d/%d]" "$percent" "$done" "$total"
 }
 
-# Function to audit one policy
+# Check a single policy in background
 check_policy() {
     local POLICY_ARN="$1"
 
-    VERSION_ID=$(aws iam get-policy --policy-arn "$POLICY_ARN" --query "Policy.DefaultVersionId" --output text 2>/dev/null) || return
-    POLICY_DOC=$(aws iam get-policy-version --policy-arn "$POLICY_ARN" --version-id "$VERSION_ID" --query "PolicyVersion.Document" --output json 2>/dev/null) || return
+    VERSION_ID=$(aws iam get-policy --policy-arn "$POLICY_ARN" \
+        --query "Policy.DefaultVersionId" \
+        --output text 2>/dev/null) || return
+
+    POLICY_DOC=$(aws iam get-policy-version \
+        --policy-arn "$POLICY_ARN" \
+        --version-id "$VERSION_ID" \
+        --query "PolicyVersion.Document" \
+        --output json 2>/dev/null) || return
 
     echo "$POLICY_DOC" | python3 "$PYTHON_CHECKER" "$POLICY_ARN" "$TMP_RESULT"
 }
 
-# Job controller
+# Main parallel loop
 PIDS=()
 for POLICY_ARN in "${POLICY_ARNS[@]}"; do
     check_policy "$POLICY_ARN" &
-
     PIDS+=($!)
     ((COUNT++))
     show_progress "$COUNT" "$TOTAL"
 
     if (( ${#PIDS[@]} >= MAX_PARALLEL )); then
         wait -n
-        # Remove finished jobs
+        # clean finished PIDs
         for i in "${!PIDS[@]}"; do
             if ! kill -0 "${PIDS[i]}" 2>/dev/null; then
                 unset 'PIDS[i]'
@@ -107,10 +119,10 @@ done
 
 wait
 show_progress "$TOTAL" "$TOTAL"
-echo -e "\n✅ Done.\n"
+echo -e "\n✅ Audit complete.\n"
 
-# Final Report
-echo -e "===== CUSTOMER-MANAGED IAM POLICY AUDIT ====="
+# Report
+echo -e "===== IAM POLICY AUDIT REPORT ====="
 printf "STATUS\tPOLICY_ARN\tDETAIL\n"
 sort "$TMP_RESULT"
 
