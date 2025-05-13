@@ -8,29 +8,19 @@ REGION="ap-south-1"
 
 echo "🔍 Auditing IAM customer-managed policies for unrestricted '*:*' permissions..."
 
-check_policy() {
-  local POLICY_ARN="$1"
+# Create a temp python script for reuse
+PYTHON_CHECKER=$(mktemp /tmp/policy_checker.XXXX.py)
 
-  # Get default version ID
-  VERSION_ID=$(aws iam get-policy --policy-arn "$POLICY_ARN" \
-    --query "Policy.DefaultVersionId" \
-    --output text 2>/dev/null)
-
-  # Get policy document
-  POLICY_DOC=$(aws iam get-policy-version \
-    --policy-arn "$POLICY_ARN" \
-    --version-id "$VERSION_ID" \
-    --query "PolicyVersion.Document" \
-    --output json 2>/dev/null)
-
-  # Pass to Python to check for *:* permissions
-  python3 - "$POLICY_ARN" "$TMP_RESULT" <<EOF
+cat > "$PYTHON_CHECKER" <<'EOF'
 import sys, json
+from subprocess import check_output, CalledProcessError
+
 arn = sys.argv[1]
 outfile = sys.argv[2]
+doc = sys.stdin.read()
 
 try:
-    policy = json.loads('''$POLICY_DOC''')
+    policy = json.loads(doc)
 except:
     with open(outfile, 'a') as f:
         f.write(f"FAIL\t{arn}\tInvalid JSON\n")
@@ -47,20 +37,19 @@ for stmt in statements:
     actions = stmt.get("Action", [])
     resources = stmt.get("Resource", [])
 
-    if isinstance(actions, str):
-        actions = [actions]
-    if isinstance(resources, str):
-        resources = [resources]
+    if isinstance(actions, str): actions = [actions]
+    if isinstance(resources, str): resources = [resources]
 
     if "*" in actions and "*" in resources:
-        # Check if policy is attached
-        from subprocess import check_output
-        attached = check_output([
-            "aws", "iam", "list-entities-for-policy",
-            "--policy-arn", arn,
-            "--query", "PolicyUsers || PolicyGroups || PolicyRoles",
-            "--output", "text"
-        ]).decode().strip()
+        try:
+            attached = check_output([
+                "aws", "iam", "list-entities-for-policy",
+                "--policy-arn", arn,
+                "--query", "PolicyUsers || PolicyGroups || PolicyRoles",
+                "--output", "text"
+            ]).decode().strip()
+        except CalledProcessError:
+            attached = ""
 
         with open(outfile, "a") as f:
             if attached:
@@ -72,21 +61,50 @@ else:
     with open(outfile, "a") as f:
         f.write(f"PASS\t{arn}\tNo full '*:*' access\n")
 EOF
-}
 
 # List all customer-managed IAM policies
-POLICY_ARNS=$(aws iam list-policies \
-  --scope Local \
-  --query "Policies[*].Arn" \
-  --output text)
+readarray -t POLICY_ARNS < <(aws iam list-policies --scope Local --query "Policies[*].Arn" --output text)
 
-JOB_COUNT=0
-for POLICY_ARN in $POLICY_ARNS; do
+TOTAL=${#POLICY_ARNS[@]}
+COUNT=0
+
+# Spinner function
+spinner() {
+  local pid=$1
+  local delay=0.1
+  local spinstr='|/-\'
+  while kill -0 $pid 2>/dev/null; do
+    local temp=${spinstr#?}
+    printf " [%c] %d%%\r" "$spinstr" $(( COUNT * 100 / TOTAL ))
+    spinstr=$temp${spinstr%"$temp"}
+    sleep $delay
+  done
+}
+
+check_policy() {
+  local POLICY_ARN="$1"
+  VERSION_ID=$(aws iam get-policy --policy-arn "$POLICY_ARN" --query "Policy.DefaultVersionId" --output text 2>/dev/null)
+
+  [ -z "$VERSION_ID" ] && return
+
+  POLICY_DOC=$(aws iam get-policy-version --policy-arn "$POLICY_ARN" --version-id "$VERSION_ID" --query "PolicyVersion.Document" --output json 2>/dev/null)
+
+  echo "$POLICY_DOC" | python3 "$PYTHON_CHECKER" "$POLICY_ARN" "$TMP_RESULT"
+  ((COUNT++))
+}
+
+export -f check_policy
+export TMP_RESULT
+export PYTHON_CHECKER
+export COUNT
+export TOTAL
+
+# Run checks with progress spinner
+for POLICY_ARN in "${POLICY_ARNS[@]}"; do
   check_policy "$POLICY_ARN" &
-
   ((JOB_COUNT++))
   if (( JOB_COUNT >= MAX_PARALLEL )); then
-    wait
+    wait -n
     JOB_COUNT=0
   fi
 done
@@ -109,4 +127,4 @@ echo "FAIL (attached *:*):      $FAILS"
 echo "WARNING (unattached *:*): $WARNS"
 echo "PASS (compliant):         $PASSES"
 
-rm -f "$TMP_RESULT"
+rm -f "$TMP_RESULT" "$PYTHON_CHECKER"
